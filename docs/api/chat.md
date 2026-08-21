@@ -33,11 +33,26 @@
 | `knowledge_ids` | string[] | 否 | 知识文件 ID 列表，指定具体文件进行检索 |
 | `agent_id` | string | 否 | 自定义 Agent ID，指定使用的智能体 |
 | `summary_model_id` | string | 否 | 覆盖默认的摘要模型 ID |
+| `rerank_model_id` | string | 否 | 检索重排序使用的 Rerank 模型（模型 ID 或唯一名称） |
 | `mentioned_items` | object[] | 否 | @提及的知识库和文件列表 |
 | `disable_title` | bool | 否 | 是否禁用自动标题生成（默认 false） |
 | `images` | object[] | 否 | 附带的图片（base64 格式），需要 Agent 启用图片上传 |
 | `channel` | string | 否 | 来源渠道标识：`web`、`api`、`im`、`browser_extension` |
 | `suggestion_attribution` | object | 否 | 用户从推荐问题发起本轮时传入 `{suggestion_set_id, question_id}`；服务端会校验归属 |
+
+**普通 KnowledgeQA 模型解析规则**：
+
+下表适用于 `/knowledge-chat/:session_id`，以及 `/agent-chat/:session_id` 最终未进入 Agent Engine、回退到普通 KnowledgeQA 的情况。这里的“Agent 配置”表示本次普通 KnowledgeQA 通过 `agent_id` 引入的配置覆盖。
+
+| 字段 | 解析顺序 | 无效值处理 |
+|------|---------|-----------|
+| `summary_model_id` | 请求值 > Agent 的 `model_id` > 知识库配置 > 自动探测可用的 KnowledgeQA 模型 | 忽略并回退 |
+| `rerank_model_id` | 请求值 > Agent 配置 > Tenant 检索配置 > 自动探测第一个可用的 Rerank 模型 | 请求值或 Agent 值无效时返回 400/403，不回退 |
+
+- 有 Agent 时其 `model_id` 必须有值且有效，否则请求失败。
+- `rerank_model_id` 仅当请求实际触发检索时解析；纯聊天请求不解析。
+- 请求级 `rerank_model_id` 支持模型 ID 或唯一模型名称，并且只会匹配当前空间内状态为 Active 的 Rerank 模型。
+- 真正进入 Agent Engine 的 `/agent-chat` 使用独立的 Rerank 规则，见下节。
 
 **请求**:
 
@@ -84,11 +99,19 @@ Agent 模式支持更智能的问答，包括工具调用、网络搜索、多�
 | `agent_id` | string | 否 | 自定义 Agent ID，指定使用的智能体（支持共享 Agent） |
 | `web_search_enabled` | bool | 否 | 是否启用网络搜索（默认 false） |
 | `summary_model_id` | string | 否 | 覆盖默认的摘要模型 ID |
+| `rerank_model_id` | string | 否 | 普通 KnowledgeQA 回退路径可用；真正进入 Agent Engine 时不作为 Rerank 模型覆盖 |
 | `mentioned_items` | object[] | 否 | @提及的知识库和文件列表 |
 | `disable_title` | bool | 否 | 是否禁用自动标题生成（默认 false） |
 | `images` | object[] | 否 | 附带的图片（base64 格式），需要 Agent 启用图片上传 |
 | `channel` | string | 否 | 来源渠道标识：`web`、`api`、`im`、`browser_extension` |
 | `suggestion_attribution` | object | 否 | 用户从推荐问题发起本轮时传入 `{suggestion_set_id, question_id}`；服务端会校验归属 |
+
+**Agent Engine 的 Rerank 规则**：
+
+- 当 `/agent-chat` 最终进入 Agent Engine 时，Rerank 模型只取 `CustomAgent.Config.RerankModelID`，请求中的 `rerank_model_id` 不参与覆盖。
+- 当 Agent 的有效工具范围允许 `knowledge_search` 时，必须在 Agent 上显式配置可用的 `rerank_model_id`；未配置或模型不可用时请求失败。
+- 当 Agent 的有效知识库范围使 `knowledge_search` 不可用时，不初始化 Rerank 模型，也不会因为缺少 Rerank 配置而失败。
+- 如果 `/agent-chat` 最终判定 Agent 模式关闭并委托给普通 KnowledgeQA，则重新使用上一节的 `request > Agent > Tenant > auto-detect` 解析规则。
 
 ## 回答后推荐问题
 

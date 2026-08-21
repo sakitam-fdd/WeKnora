@@ -51,7 +51,7 @@ func TestQuotedContextRemainsPromptOnlyForKnowledgeQA(t *testing.T) {
 	)
 
 	queryManager := chatpipeline.NewEventManager()
-	chatpipeline.NewPluginQueryUnderstand(queryManager, nil, nil, &config.Config{})
+	chatpipeline.NewPluginQueryUnderstand(queryManager, nil, nil, nil, &config.Config{})
 	chatManage := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{
 			Query:         query,
