@@ -1,41 +1,334 @@
-name: tmp-pr2494-conflict-inspect
+name: tmp-pr2494-resolve-and-test
 
 on:
   pull_request:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inspect-conflicts:
+  resolve-and-test:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: fix/pr-2494-rerank-resolution
           fetch-depth: 0
 
-      - name: Merge upstream PR #2494 without committing
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Merge upstream #2494 and resolve current-main conflict
         shell: bash
         run: |
-          set +e
-          git config user.name "pr2494-conflict-inspector"
-          git config user.email "actions@users.noreply.github.com"
-          git remote add tencent-upstream https://github.com/Tencent/WeKnora.git
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add tencent-upstream https://github.com/Tencent/WeKnora.git 2>/dev/null || true
           git fetch --no-tags tencent-upstream refs/pull/2494/head:refs/remotes/tencent-upstream/pr-2494
+
+          set +e
           git merge --no-commit --no-ff refs/remotes/tencent-upstream/pr-2494
           merge_rc=$?
-          echo "merge_rc=$merge_rc"
-          echo "=== CONFLICT FILES ==="
-          git diff --name-only --diff-filter=U
-          echo "=== STATUS ==="
-          git status --short
-          echo "=== CONFLICT HUNKS ==="
-          for f in $(git diff --name-only --diff-filter=U); do
-            echo "----- $f -----"
-            git diff --cc -- "$f" || true
-          done
+          set -e
+
           if [ "$merge_rc" -eq 0 ]; then
-            echo "Unexpectedly clean merge."
+            echo "Expected one current-main conflict, but upstream merged cleanly; refusing an unreviewed topology change."
+            exit 1
           fi
-          exit "$merge_rc"
+
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+          printf 'Conflicts: %s\n' "${conflicts[*]}"
+          if [ "${#conflicts[@]}" -ne 1 ] || [ "${conflicts[0]}" != "internal/application/service/session_knowledge_qa.go" ]; then
+            echo "Unexpected conflict surface; aborting."
+            exit 1
+          fi
+
+          # Keep current-main helper/session structure. Upstream's two resolver
+          # functions are moved into a dedicated file below, which avoids
+          # deleting the existing Agent override as a side effect of the port.
+          git show HEAD:internal/application/service/session.go > internal/application/service/session.go
+          git show HEAD:internal/application/service/session_qa_helpers.go > internal/application/service/session_qa_helpers.go
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("internal/application/service/session_knowledge_qa.go")
+          s = path.read_text()
+
+          # There must be exactly one conflict. Keep current main's Agent override
+          # and long-term-memory setup; upstream removed/moved this block only to
+          # establish rerank precedence, which we handle explicitly later.
+          pattern = re.compile(
+              r"<<<<<<< HEAD\n(.*?)=======\n>>>>>>> refs/remotes/tencent-upstream/pr-2494\n",
+              re.S,
+          )
+          matches = list(pattern.finditer(s))
+          if len(matches) != 1:
+              raise SystemExit(f"expected exactly one conflict marker block, got {len(matches)}")
+          s = pattern.sub(lambda m: m.group(1), s, count=1)
+
+          # Do not load tenant retrieval configuration for a pure-chat turn.
+          # Resolve it only after needsRAG is known.
+          upstream_preload = '''\t// Load tenant-level retrieval config (nil is safe; used for rerank model fallback)
+\tvar rc *types.RetrievalConfig
+\tif tenant, err2 := s.tenantService.GetTenantByID(ctx, retrievalTenantID); err2 == nil {
+\t\trc = tenant.RetrievalConfig
+\t}
+
+'''
+          if s.count(upstream_preload) != 1:
+              raise SystemExit("upstream retrieval-config preload anchor changed")
+          s = s.replace(upstream_preload, "", 1)
+
+          upstream_resolver = '''\t// Resolve the rerank model: request override (hard-failing 400/403) then
+\t// agent config, then tenant RetrievalConfig, then auto-detect.
+\t// Only when retrieval actually runs.
+\tvar agentRerankModelID string
+\tif req.CustomAgent != nil {
+\t\tagentRerankModelID = req.CustomAgent.Config.RerankModelID
+\t}
+\tif needsRAG {
+\t\tchatManage.RerankModelID, err = s.resolveRerankModelID(ctx, req.RerankModelID, agentRerankModelID, rc)
+\t\tif err != nil {
+\t\t\treturn err
+\t\t}
+\t}
+
+'''
+          current_main_resolver = '''\t// Resolve the final rerank model only for retrieval turns. Current main
+\t// applies Agent overrides above; resolving here intentionally makes an
+\t// explicit request override win while preserving all other Agent settings.
+\tif needsRAG {
+\t\tvar agentRerankModelID string
+\t\tif req.CustomAgent != nil {
+\t\t\tagentRerankModelID = req.CustomAgent.Config.RerankModelID
+\t\t}
+
+\t\tvar retrievalConfig *types.RetrievalConfig
+\t\tif s.tenantService != nil {
+\t\t\ttenant, tenantErr := s.tenantService.GetTenantByID(ctx, retrievalTenantID)
+\t\t\tif tenantErr == nil && tenant != nil {
+\t\t\t\tretrievalConfig = tenant.RetrievalConfig
+\t\t\t} else if tenantErr != nil {
+\t\t\t\tlogger.Warnf(ctx, "Failed to load tenant retrieval config for rerank resolution: %v", tenantErr)
+\t\t\t}
+\t\t}
+
+\t\tchatManage.RerankModelID, err = s.resolveRerankModelID(
+\t\t\tctx, req.RerankModelID, agentRerankModelID, retrievalConfig,
+\t\t)
+\t\tif err != nil {
+\t\t\treturn err
+\t\t}
+\t}
+
+'''
+          if s.count(upstream_resolver) != 1:
+              raise SystemExit("upstream rerank resolver anchor changed")
+          s = s.replace(upstream_resolver, current_main_resolver, 1)
+
+          # Upstream calls applyAgentOverrides after its resolver because it also
+          # removes RerankModelID assignment from the helper. We deliberately keep
+          # current main's helper and its earlier call, so the later duplicate must
+          # be removed or the Agent value would incorrectly overwrite request.
+          duplicate_agent_apply = '''\t// Apply custom agent overrides (system prompt, temperature, retrieval params,
+\t// rewrite, fallback, FAQ strategy, history turns)
+\ts.applyAgentOverridesToChatManage(ctx, req.CustomAgent, chatManage)
+
+'''
+          if s.count(duplicate_agent_apply) != 2:
+              raise SystemExit(f"expected two Agent override blocks after merge, got {s.count(duplicate_agent_apply)}")
+          idx = s.rfind(duplicate_agent_apply)
+          s = s[:idx] + s[idx + len(duplicate_agent_apply):]
+
+          if "<<<<<<<" in s or "=======" in s or ">>>>>>>" in s:
+              raise SystemExit("unresolved conflict marker remains")
+          path.write_text(s)
+
+          # Upstream puts these functions into session.go/session_qa_helpers.go.
+          # Keep current-main files untouched and isolate the new responsibility.
+          Path("internal/application/service/session_rerank_resolution.go").write_text(r'''package service
+
+import (
+    "context"
+    "strings"
+
+    apperrors "github.com/Tencent/WeKnora/internal/errors"
+    "github.com/Tencent/WeKnora/internal/logger"
+    "github.com/Tencent/WeKnora/internal/types"
+    secutils "github.com/Tencent/WeKnora/internal/utils"
+)
+
+// ResolveRerankModel resolves an explicit rerank model ID or unique active-model name.
+// Explicit invalid values fail closed instead of silently falling back to another model.
+func (s *sessionService) ResolveRerankModel(ctx context.Context, requested string) (string, error) {
+    requested = strings.TrimSpace(requested)
+    if requested == "" {
+        return "", nil
+    }
+    if s.modelService == nil {
+        return "", apperrors.NewInternalServerError("model service not available")
+    }
+
+    models, err := s.modelService.ListModels(ctx)
+    if err != nil {
+        return "", err
+    }
+
+    var nameMatch string
+    nameMatches := 0
+    for _, model := range models {
+        if model == nil || model.Type != types.ModelTypeRerank || model.Status != types.ModelStatusActive {
+            continue
+        }
+        if model.ID == requested {
+            return model.ID, nil
+        }
+        if model.Name == requested {
+            nameMatch = model.ID
+            nameMatches++
+        }
+    }
+
+    if nameMatches > 1 {
+        logger.Warnf(ctx, "Request provided ambiguous rerank model %s", secutils.SanitizeForLog(requested))
+        return "", apperrors.NewBadRequestError("rerank_model_id matches multiple models")
+    }
+    if nameMatches == 1 {
+        return nameMatch, nil
+    }
+
+    logger.Warnf(ctx, "Request provided invalid rerank model %s", secutils.SanitizeForLog(requested))
+    return "", apperrors.NewForbiddenError("rerank model not found or not accessible")
+}
+
+// resolveRerankModelID applies the effective precedence for retrieval requests:
+// request override > Custom Agent > tenant RetrievalConfig > first active rerank model.
+func (s *sessionService) resolveRerankModelID(
+    ctx context.Context,
+    requested string,
+    agentRerankModelID string,
+    retrievalConfig *types.RetrievalConfig,
+) (string, error) {
+    if strings.TrimSpace(requested) != "" {
+        resolved, err := s.ResolveRerankModel(ctx, requested)
+        if err != nil {
+            return "", err
+        }
+        logger.Infof(ctx, "Using request rerank model override: %s", secutils.SanitizeForLog(resolved))
+        return resolved, nil
+    }
+
+    if strings.TrimSpace(agentRerankModelID) != "" {
+        resolved, err := s.ResolveRerankModel(ctx, agentRerankModelID)
+        if err != nil {
+            return "", err
+        }
+        logger.Infof(ctx, "Using custom agent rerank model: %s", secutils.SanitizeForLog(resolved))
+        return resolved, nil
+    }
+
+    if retrievalConfig != nil && retrievalConfig.RerankModelID != "" {
+        logger.Infof(ctx, "Using tenant retrieval config rerank model: %s",
+            secutils.SanitizeForLog(retrievalConfig.RerankModelID))
+        return retrievalConfig.RerankModelID, nil
+    }
+
+    if s.modelService == nil {
+        return "", nil
+    }
+    models, err := s.modelService.ListModels(ctx)
+    if err != nil {
+        // Auto-detect is a compatibility fallback: failure to enumerate models
+        // must not turn an otherwise valid retrieval request into a hard error.
+        logger.Warnf(ctx, "Failed to list rerank models for auto-detect, skipping rerank: %v", err)
+        return "", nil
+    }
+    for _, model := range models {
+        if model != nil && model.Type == types.ModelTypeRerank && model.Status == types.ModelStatusActive {
+            logger.Infof(ctx, "Auto-detected first active rerank model: %s", secutils.SanitizeForLog(model.ID))
+            return model.ID, nil
+        }
+    }
+    return "", nil
+}
+''')
+
+          # Adapt upstream's structural test to the evolved current-main order:
+          # Agent overrides remain intact, then the final resolver overwrites only
+          # RerankModelID when an explicit request wins.
+          test_path = Path("internal/application/service/session_rerank_resolution_test.go")
+          test_src = test_path.read_text()
+          marker = "// --- applyAgentOverridesToChatManage regression ---"
+          if test_src.count(marker) != 1:
+              raise SystemExit("upstream rerank structural-test marker changed")
+          prefix = test_src.split(marker, 1)[0]
+          test_src = prefix + r'''// --- current-main ordering regression ---
+
+// Current main applies Agent overrides before the final RAG-only rerank
+// resolution. The resolver must therefore be able to overwrite the pre-applied
+// Agent value when the request explicitly selects another valid reranker.
+func TestCurrentMainRerankResolution_RequestOverridesPreAppliedAgent(t *testing.T) {
+    ms := &rerankResolutionModelService{models: activeRerankModels()}
+    svc := newRerankResolutionService(ms)
+    ctx := context.Background()
+
+    cm := &types.ChatManage{}
+    agent := &types.CustomAgent{Config: types.CustomAgentConfig{RerankModelID: "rerank-2"}}
+    svc.applyAgentOverridesToChatManage(ctx, agent, cm)
+    require.Equal(t, "rerank-2", cm.RerankModelID)
+
+    resolved, err := svc.resolveRerankModelID(ctx,
+        "rerank-1", agent.Config.RerankModelID, &types.RetrievalConfig{RerankModelID: "tenant-model"})
+    require.NoError(t, err)
+    cm.RerankModelID = resolved
+    assert.Equal(t, "rerank-1", cm.RerankModelID)
+}
+'''
+          test_path.write_text(test_src)
+          PY
+
+          gofmt -w \
+            internal/application/service/session_knowledge_qa.go \
+            internal/application/service/session_rerank_resolution.go \
+            internal/application/service/session_rerank_resolution_test.go \
+            internal/handler/session/qa.go \
+            internal/handler/session/search_knowledge_test.go \
+            internal/handler/session/types.go \
+            internal/im/cmd_search.go \
+            internal/types/interfaces/session.go \
+            internal/types/qa_request.go
+
+          git add -A
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Unresolved conflicts remain"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          git diff --cached --check
+
+      - name: Validate resolver semantics
+        run: go test ./internal/application/service -run 'TestResolveRerankModel|TestCurrentMainRerankResolution' -count=1
+
+      - name: Validate HTTP error mapping and request wiring
+        run: go test ./internal/handler/session -run 'TestSearchKnowledge' -count=1
+
+      - name: Compile IM command integration
+        run: go test ./internal/im -run '^$' -count=1
+
+      - name: Commit resolved merge to dedicated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/tmp-pr2494-conflict.yml
+          git add -A
+          git diff --cached --check
+          git status --short
+          git commit -m "feat(chat): resolve rerank model wiring from upstream #2494"
+          git push origin HEAD:fix/pr-2494-rerank-resolution
