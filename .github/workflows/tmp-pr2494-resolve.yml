@@ -57,6 +57,8 @@ jobs:
               raise SystemExit(f"unexpected current-main test drift anchor count: {s.count(old)}")
           p.write_text(s.replace(old, new, 1))
           PY
+            "\$real_go" "\$@"
+            exit \$?
           fi
           exec "\$real_go" "\$@"
           EOF
