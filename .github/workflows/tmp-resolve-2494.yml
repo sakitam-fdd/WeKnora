@@ -1,0 +1,346 @@
+name: tmp-resolve-2494
+
+on:
+  push:
+    branches:
+      - upstream-conflict-2494-resolve-20260821
+
+permissions:
+  contents: write
+
+jobs:
+  port-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-conflict-2494-resolve-20260821
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply current-main adaptation
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"expected patch anchor not found in {path}: {old[:120]!r}")
+              if s.count(old) != 1:
+                  raise SystemExit(f"patch anchor is not unique in {path}: {old[:120]!r}")
+              p.write_text(s.replace(old, new, 1))
+
+          replace_once(
+              "internal/types/qa_request.go",
+              "\tSummaryModelID      string             // Optional model override; empty = use agent/KB default\n",
+              "\tSummaryModelID      string             // Optional model override; empty = use agent/KB default\n"
+              "\tRerankModelID       string             // Optional rerank model ID or unique name; empty = agent/tenant config or auto-detect\n",
+          )
+
+          replace_once(
+              "internal/handler/session/types.go",
+              "\tSummaryModelID        string                       `json:\"summary_model_id\"`                      // Optional summary model ID for this request (overrides session default)\n",
+              "\tSummaryModelID        string                       `json:\"summary_model_id\"`                      // Optional summary model ID for this request (overrides session default)\n"
+              "\tRerankModelID         string                       `json:\"rerank_model_id,omitempty\"`             // Optional rerank model ID or unique name\n",
+          )
+          replace_once(
+              "internal/handler/session/types.go",
+              "\tMentionedItems   []MentionedItemRequest `json:\"mentioned_items\"`                       // Optional scoped tag mentions\n",
+              "\tMentionedItems   []MentionedItemRequest `json:\"mentioned_items\"`                       // Optional scoped tag mentions\n"
+              "\tRerankModelID    string                 `json:\"rerank_model_id,omitempty\"`             // Optional rerank model ID or unique name\n",
+          )
+
+          replace_once(
+              "internal/handler/session/qa.go",
+              "\tsummaryModelID        string\n\twebSearchEnabled      bool\n",
+              "\tsummaryModelID        string\n\trerankModelID         string\n\twebSearchEnabled      bool\n",
+          )
+          replace_once(
+              "internal/handler/session/qa.go",
+              "\t\tSummaryModelID:      rc.summaryModelID,\n",
+              "\t\tSummaryModelID:      rc.summaryModelID,\n\t\tRerankModelID:       rc.rerankModelID,\n",
+          )
+          replace_once(
+              "internal/handler/session/qa.go",
+              "\t\tsummaryModelID:        secutils.SanitizeForLog(request.SummaryModelID),\n\t\twebSearchEnabled:      request.WebSearchEnabled,\n",
+              "\t\tsummaryModelID:        secutils.SanitizeForLog(request.SummaryModelID),\n\t\trerankModelID:         request.RerankModelID,\n\t\twebSearchEnabled:      request.WebSearchEnabled,\n",
+          )
+          replace_once(
+              "internal/handler/session/qa.go",
+              "\tsearchResults, err := h.sessionService.SearchKnowledge(ctx, knowledgeBaseIDs, request.KnowledgeIDs, tagScopes, request.Query)\n\tif err != nil {\n\t\tlogger.ErrorWithFields(ctx, err, nil)\n\t\tc.Error(errors.NewInternalServerError(err.Error()))\n\t\treturn\n\t}\n",
+              "\tsearchResults, err := h.sessionService.SearchKnowledge(ctx, knowledgeBaseIDs, request.KnowledgeIDs, tagScopes, request.Query, request.RerankModelID)\n"
+              "\tif err != nil {\n"
+              "\t\tlogger.ErrorWithFields(ctx, err, nil)\n"
+              "\t\tif appErr, ok := errors.IsAppError(err); ok {\n"
+              "\t\t\t_ = c.Error(appErr)\n"
+              "\t\t} else {\n"
+              "\t\t\t_ = c.Error(errors.NewInternalServerError(err.Error()))\n"
+              "\t\t}\n"
+              "\t\treturn\n"
+              "\t}\n",
+          )
+
+          replace_once(
+              "internal/types/interfaces/session.go",
+              "\tSearchKnowledge(ctx context.Context, knowledgeBaseIDs []string, knowledgeIDs []string, tagScopes []types.TagScope, query string) ([]*types.SearchResult, error)\n",
+              "\tSearchKnowledge(ctx context.Context, knowledgeBaseIDs []string, knowledgeIDs []string, tagScopes []types.TagScope, query string, rerankModelID string) ([]*types.SearchResult, error)\n",
+          )
+
+          replace_once(
+              "internal/application/service/session_knowledge_qa.go",
+              "\t// Resolve retrieval tenant scope using shared helper\n\tretrievalTenantID := s.resolveRetrievalTenantID(ctx, req)\n\n\t// Build unified search targets",
+              "\t// Resolve retrieval tenant scope using shared helper\n\tretrievalTenantID := s.resolveRetrievalTenantID(ctx, req)\n\n"
+              "\t// Tenant retrieval config participates in rerank-model fallback.\n"
+              "\tvar retrievalConfig *types.RetrievalConfig\n"
+              "\tif tenant, tenantErr := s.tenantService.GetTenantByID(ctx, retrievalTenantID); tenantErr == nil && tenant != nil {\n"
+              "\t\tretrievalConfig = tenant.RetrievalConfig\n"
+              "\t}\n\n"
+              "\t// Build unified search targets",
+          )
+          replace_once(
+              "internal/application/service/session_knowledge_qa.go",
+              "\thasKB := types.HasKnowledgeRetrievalScope(searchTargets, knowledgeBaseIDs, knowledgeIDs)\n\tneedsRAG := hasKB || req.WebSearchEnabled\n\thasHistory := chatManage.MaxRounds > 0\n\n\tvar pipeline []types.EventType\n",
+              "\thasKB := types.HasKnowledgeRetrievalScope(searchTargets, knowledgeBaseIDs, knowledgeIDs)\n"
+              "\tneedsRAG := hasKB || req.WebSearchEnabled\n"
+              "\thasHistory := chatManage.MaxRounds > 0\n\n"
+              "\t// Resolve after agent overrides so the final precedence is request > agent > tenant > auto-detect.\n"
+              "\tvar agentRerankModelID string\n"
+              "\tif req.CustomAgent != nil {\n"
+              "\t\tagentRerankModelID = req.CustomAgent.Config.RerankModelID\n"
+              "\t}\n"
+              "\tif needsRAG {\n"
+              "\t\tchatManage.RerankModelID, err = s.resolveRerankModelID(ctx, req.RerankModelID, agentRerankModelID, retrievalConfig)\n"
+              "\t\tif err != nil {\n"
+              "\t\t\treturn err\n"
+              "\t\t}\n"
+              "\t}\n\n"
+              "\tvar pipeline []types.EventType\n",
+          )
+          replace_once(
+              "internal/application/service/session_knowledge_qa.go",
+              "func (s *sessionService) SearchKnowledge(ctx context.Context,\n\tknowledgeBaseIDs []string, knowledgeIDs []string, tagScopes []types.TagScope, query string,\n) ([]*types.SearchResult, error) {",
+              "func (s *sessionService) SearchKnowledge(ctx context.Context,\n\tknowledgeBaseIDs []string, knowledgeIDs []string, tagScopes []types.TagScope, query string, rerankModelID string,\n) ([]*types.SearchResult, error) {",
+          )
+          replace_once(
+              "internal/application/service/session_knowledge_qa.go",
+              "\t// Get default models\n\tmodels, err := s.modelService.ListModels(ctx)\n\tif err != nil {\n\t\tlogger.Errorf(ctx, \"Failed to get models: %v\", err)\n\t\treturn nil, err\n\t}\n\n\t// Use rerank model from RetrievalConfig if set, otherwise auto-select the first available\n\tif rc != nil && rc.RerankModelID != \"\" {\n\t\tchatManage.RerankModelID = rc.RerankModelID\n\t} else {\n\t\tfor _, model := range models {\n\t\t\tif model == nil {\n\t\t\t\tcontinue\n\t\t\t}\n\t\t\tif model.Type == types.ModelTypeRerank {\n\t\t\t\tchatManage.RerankModelID = model.ID\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n\t}\n",
+              "\t// Use the same rerank resolver as KnowledgeQA.\n"
+              "\tchatManage.RerankModelID, err = s.resolveRerankModelID(ctx, rerankModelID, \"\", rc)\n"
+              "\tif err != nil {\n"
+              "\t\tlogger.Errorf(ctx, \"Failed to resolve rerank model: %v\", err)\n"
+              "\t\treturn nil, err\n"
+              "\t}\n",
+          )
+
+          replace_once(
+              "internal/im/cmd_search.go",
+              "\tresults, err := c.sessionService.SearchKnowledge(ctx, kbIDs, nil, nil, query)\n",
+              "\tvar rerankModelID string\n"
+              "\tif cmdCtx.CustomAgent != nil {\n"
+              "\t\trerankModelID = cmdCtx.CustomAgent.Config.RerankModelID\n"
+              "\t}\n\n"
+              "\tresults, err := c.sessionService.SearchKnowledge(ctx, kbIDs, nil, nil, query, rerankModelID)\n",
+          )
+
+          Path("internal/application/service/session_rerank_resolution.go").write_text(r'''package service
+
+import (
+    "context"
+    "strings"
+
+    apperrors "github.com/Tencent/WeKnora/internal/errors"
+    "github.com/Tencent/WeKnora/internal/logger"
+    "github.com/Tencent/WeKnora/internal/types"
+    secutils "github.com/Tencent/WeKnora/internal/utils"
+)
+
+// ResolveRerankModel resolves an explicit rerank model ID or unique active-model name.
+// Explicit invalid values fail closed instead of silently falling back to another model.
+func (s *sessionService) ResolveRerankModel(ctx context.Context, requested string) (string, error) {
+    requested = strings.TrimSpace(requested)
+    if requested == "" {
+        return "", nil
+    }
+    if s.modelService == nil {
+        return "", apperrors.NewInternalServerError("model service not available")
+    }
+    models, err := s.modelService.ListModels(ctx)
+    if err != nil {
+        return "", err
+    }
+    var nameMatch string
+    nameMatches := 0
+    for _, model := range models {
+        if model == nil || model.Type != types.ModelTypeRerank || model.Status != types.ModelStatusActive {
+            continue
+        }
+        if model.ID == requested {
+            return model.ID, nil
+        }
+        if model.Name == requested {
+            nameMatch = model.ID
+            nameMatches++
+        }
+    }
+    if nameMatches > 1 {
+        logger.Warnf(ctx, "Request provided ambiguous rerank model %s", secutils.SanitizeForLog(requested))
+        return "", apperrors.NewBadRequestError("rerank_model_id matches multiple models")
+    }
+    if nameMatches == 1 {
+        return nameMatch, nil
+    }
+    logger.Warnf(ctx, "Request provided invalid rerank model %s", secutils.SanitizeForLog(requested))
+    return "", apperrors.NewForbiddenError("rerank model not found or not accessible")
+}
+
+// resolveRerankModelID applies one shared precedence chain for KnowledgeQA and SearchKnowledge:
+// request override > custom-agent config > tenant RetrievalConfig > first active rerank model.
+func (s *sessionService) resolveRerankModelID(
+    ctx context.Context,
+    requested string,
+    agentRerankModelID string,
+    rc *types.RetrievalConfig,
+) (string, error) {
+    if strings.TrimSpace(requested) != "" {
+        resolved, err := s.ResolveRerankModel(ctx, requested)
+        if err != nil {
+            return "", err
+        }
+        logger.Infof(ctx, "Using request rerank model override: %s", secutils.SanitizeForLog(resolved))
+        return resolved, nil
+    }
+    if strings.TrimSpace(agentRerankModelID) != "" {
+        resolved, err := s.ResolveRerankModel(ctx, agentRerankModelID)
+        if err != nil {
+            return "", err
+        }
+        logger.Infof(ctx, "Using custom agent rerank model: %s", secutils.SanitizeForLog(resolved))
+        return resolved, nil
+    }
+    if rc != nil && rc.RerankModelID != "" {
+        logger.Infof(ctx, "Using tenant retrieval config rerank model: %s", secutils.SanitizeForLog(rc.RerankModelID))
+        return rc.RerankModelID, nil
+    }
+    if s.modelService == nil {
+        return "", nil
+    }
+    models, err := s.modelService.ListModels(ctx)
+    if err != nil {
+        logger.Warnf(ctx, "Failed to list rerank models for auto-detect, skipping rerank: %v", err)
+        return "", nil
+    }
+    for _, model := range models {
+        if model != nil && model.Type == types.ModelTypeRerank && model.Status == types.ModelStatusActive {
+            logger.Infof(ctx, "Auto-detected first active rerank model: %s", secutils.SanitizeForLog(model.ID))
+            return model.ID, nil
+        }
+    }
+    return "", nil
+}
+''')
+
+          Path("internal/application/service/session_rerank_resolution_test.go").write_text(r'''package service
+
+import (
+    "context"
+    "errors"
+    "testing"
+
+    "github.com/stretchr/testify/require"
+    "github.com/Tencent/WeKnora/internal/types"
+    "github.com/Tencent/WeKnora/internal/types/interfaces"
+)
+
+type rerankResolutionModelService struct {
+    interfaces.ModelService
+    models []*types.Model
+    err error
+}
+
+func (m *rerankResolutionModelService) ListModels(context.Context) ([]*types.Model, error) {
+    if m.err != nil { return nil, m.err }
+    return m.models, nil
+}
+
+func TestResolveRerankModelIDPrecedence(t *testing.T) {
+    svc := &sessionService{modelService: &rerankResolutionModelService{models: []*types.Model{
+        {ID: "req", Name: "request", Type: types.ModelTypeRerank, Status: types.ModelStatusActive},
+        {ID: "agent", Name: "agent", Type: types.ModelTypeRerank, Status: types.ModelStatusActive},
+        {ID: "auto", Name: "auto", Type: types.ModelTypeRerank, Status: types.ModelStatusActive},
+    }}}
+    ctx := context.Background()
+    rc := &types.RetrievalConfig{RerankModelID: "tenant"}
+
+    got, err := svc.resolveRerankModelID(ctx, "request", "agent", rc)
+    require.NoError(t, err)
+    require.Equal(t, "req", got)
+
+    got, err = svc.resolveRerankModelID(ctx, "", "agent", rc)
+    require.NoError(t, err)
+    require.Equal(t, "agent", got)
+
+    got, err = svc.resolveRerankModelID(ctx, "", "", rc)
+    require.NoError(t, err)
+    require.Equal(t, "tenant", got)
+
+    got, err = svc.resolveRerankModelID(ctx, "", "", nil)
+    require.NoError(t, err)
+    require.Equal(t, "auto", got)
+}
+
+func TestResolveRerankModelRejectsInvalidExplicitValue(t *testing.T) {
+    svc := &sessionService{modelService: &rerankResolutionModelService{models: []*types.Model{
+        {ID: "active", Name: "active-name", Type: types.ModelTypeRerank, Status: types.ModelStatusActive},
+        {ID: "inactive", Name: "inactive-name", Type: types.ModelTypeRerank, Status: types.ModelStatusInactive},
+    }}}
+    _, err := svc.ResolveRerankModel(context.Background(), "missing")
+    require.Error(t, err)
+}
+
+func TestResolveRerankModelAutoDetectListFailureIsNonFatal(t *testing.T) {
+    svc := &sessionService{modelService: &rerankResolutionModelService{err: errors.New("list failed")}}
+    got, err := svc.resolveRerankModelID(context.Background(), "", "", nil)
+    require.NoError(t, err)
+    require.Empty(t, got)
+}
+''')
+
+          # The temporary workflow must not survive the generated commit.
+          Path(".github/workflows/tmp-resolve-2494.yml").unlink()
+          PY
+
+      - name: Format
+        run: |
+          gofmt -w \
+            internal/application/service/session_rerank_resolution.go \
+            internal/application/service/session_rerank_resolution_test.go \
+            internal/application/service/session_knowledge_qa.go \
+            internal/handler/session/qa.go \
+            internal/handler/session/types.go \
+            internal/im/cmd_search.go \
+            internal/types/interfaces/session.go \
+            internal/types/qa_request.go
+
+      - name: Validate focused packages
+        run: |
+          go test ./internal/application/service -run 'Rerank' -count=1
+          go test ./internal/handler/session -run 'SearchKnowledge|PromptContext' -count=1
+          go test ./internal/im/... -run 'Search' -count=1
+          go vet ./internal/application/service ./internal/handler/session ./internal/im/...
+          git diff --check
+
+      - name: Commit resolved port
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(chat): wire rerank model resolution into KnowledgeQA"
+          git push origin HEAD:upstream-conflict-2494-resolve-20260821
