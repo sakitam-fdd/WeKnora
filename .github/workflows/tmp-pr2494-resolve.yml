@@ -1,0 +1,25 @@
+name: tmp-pr2494-resolve
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/pr-2494-rerank-resolution
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Resolve upstream #2494 and validate
+        shell: bash
+        run: bash .github/scripts/resolve-pr2494.sh
