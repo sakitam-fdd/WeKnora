@@ -1,0 +1,41 @@
+name: tmp-pr2494-conflict-inspect
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-conflicts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream PR #2494 without committing
+        shell: bash
+        run: |
+          set +e
+          git config user.name "pr2494-conflict-inspector"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add tencent-upstream https://github.com/Tencent/WeKnora.git
+          git fetch --no-tags tencent-upstream refs/pull/2494/head:refs/remotes/tencent-upstream/pr-2494
+          git merge --no-commit --no-ff refs/remotes/tencent-upstream/pr-2494
+          merge_rc=$?
+          echo "merge_rc=$merge_rc"
+          echo "=== CONFLICT FILES ==="
+          git diff --name-only --diff-filter=U
+          echo "=== STATUS ==="
+          git status --short
+          echo "=== CONFLICT HUNKS ==="
+          for f in $(git diff --name-only --diff-filter=U); do
+            echo "----- $f -----"
+            git diff --cc -- "$f" || true
+          done
+          if [ "$merge_rc" -eq 0 ]; then
+            echo "Unexpectedly clean merge."
+          fi
+          exit "$merge_rc"
