@@ -20,6 +20,49 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # Current main has an unrelated stale test call: NewPluginQueryUnderstand
+      # now accepts MemoryService, while qa_prompt_context_test.go still uses the
+      # old four-argument constructor. Wrap only the handler-session go test so
+      # CI can validate #2494 without committing that unrelated repair.
+      - name: Install temporary go wrapper for unrelated main test drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          real_go="$(command -v go)"
+          wrapper_dir="$RUNNER_TEMP/pr2494-go-wrapper"
+          mkdir -p "$wrapper_dir"
+          cat > "$wrapper_dir/go" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          real_go="$real_go"
+          target="internal/handler/session/qa_prompt_context_test.go"
+          needs_patch=false
+          for arg in "\$@"; do
+            if [ "\$arg" = "./internal/handler/session" ]; then
+              needs_patch=true
+            fi
+          done
+          if [ "\$needs_patch" = true ] && [ -f "\$target" ]; then
+            backup="\$(mktemp)"
+            cp "\$target" "\$backup"
+            trap 'cp "\$backup" "\$target"; rm -f "\$backup"' EXIT
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("internal/handler/session/qa_prompt_context_test.go")
+          s = p.read_text()
+          old = "chatpipeline.NewPluginQueryUnderstand(eventManager, nil, nil, cfg)"
+          new = "chatpipeline.NewPluginQueryUnderstand(eventManager, nil, nil, nil, cfg)"
+          if s.count(old) != 1:
+              raise SystemExit(f"unexpected current-main test drift anchor count: {s.count(old)}")
+          p.write_text(s.replace(old, new, 1))
+          PY
+          fi
+          exec "\$real_go" "\$@"
+          EOF
+          chmod +x "$wrapper_dir/go"
+          echo "$wrapper_dir" >> "$GITHUB_PATH"
+
       - name: Resolve upstream #2494 and validate
         shell: bash
         run: bash .github/scripts/resolve-pr2494.sh
