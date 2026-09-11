@@ -165,6 +165,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewMCPToolApprovalRepository))
 	must(container.Provide(repository.NewMCPOAuthRepository))
 	must(container.Provide(repository.NewTenantSandboxConfigRepository))
+	must(container.Provide(repository.NewTenantSkillRepository))
 	must(container.Provide(repository.NewCustomAgentRepository))
 	must(container.Provide(repository.NewOrganizationRepository))
 	must(container.Provide(repository.NewKBShareRepository))
@@ -220,8 +221,10 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(func(
 		repo repository.TenantSandboxConfigRepository,
 		agents interfaces.CustomAgentRepository,
+		skills repository.TenantSkillRepository,
+		files interfaces.StorageBackendResolver,
 	) *service.TenantSandboxConfigService {
-		return service.NewTenantSandboxConfigService(repo, agents, buildGlobalSandboxConfig())
+		return service.NewTenantSandboxConfigService(repo, agents, buildGlobalSandboxConfig(), skills, files)
 	}))
 	must(container.Provide(func(s *service.TenantSandboxConfigService) service.WorkspaceSandboxPolicy {
 		return s
@@ -295,6 +298,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 
 	logger.Debugf(ctx, "[Container] Registering session service...")
 	must(container.Provide(service.NewSessionService))
+	must(container.Provide(service.NewTenantSkillService))
+	// The member-facing half of env vars is its own service because its
+	// authority is different in kind: it derives the identity from the context
+	// and touches only that identity's rows.
+	must(container.Provide(service.NewUserEnvService))
 
 	// ArtifactCollector drains skill-generated files from the sandbox on
 	// each agent turn (see spec at
@@ -302,6 +310,11 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	// The factory returns nil when the sandbox backend does not support
 	// per-session file inspection; downstream code guards on nil.
 	must(container.Provide(service.NewArtifactCollectorFromSandboxManager))
+
+	// SandboxTerminalService opens interactive PTYs on session sandboxes for
+	// the frontend terminal panel. First-use provisioning takes a sandbox
+	// config ID already resolved by the WebSocket handler (own or shared agent).
+	must(container.Provide(service.NewSandboxTerminalService))
 
 	logger.Debugf(ctx, "[Container] Registering task enqueuer...")
 	redisAvailable := os.Getenv("REDIS_ADDR") != ""
@@ -374,6 +387,13 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Invoke(chatpipeline.NewPluginMemoryAffinity))
 	logger.Debugf(ctx, "[Container] Chat pipeline plugins registered")
 
+	// TenantSkillService is provided next to SessionService (handlers need
+	// it), but Invoke constructs the whole chain. SessionService needs
+	// *chatpipeline.EventManager, which only exists after the pipeline
+	// block above — starting the reaper any earlier panics.
+	must(container.Invoke(startTenantSkillReaper))
+	logger.Debugf(ctx, "[Container] Tenant skill reaper registered")
+
 	// HTTP handlers layer
 	logger.Debugf(ctx, "[Container] Registering HTTP handlers...")
 	must(container.Provide(handler.NewTenantHandler))
@@ -390,6 +410,12 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewMessageSuggestionHandler))
 	must(container.Provide(handler.NewModelHandler))
 	must(container.Provide(handler.NewSandboxConfigHandler))
+	must(container.Provide(func(
+		s *service.TenantSkillService, streams interfaces.StreamManager,
+	) *handler.SandboxSkillHandler {
+		return handler.NewSandboxSkillHandler(s, streams)
+	}))
+	must(container.Provide(handler.NewMeEnvVarHandler))
 	must(container.Provide(handler.NewEvaluationHandler))
 	must(container.Provide(handler.NewInitializationHandler))
 	must(container.Provide(handler.NewAuthHandler))
@@ -406,8 +432,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewStorageBackendHandler))
 	must(container.Provide(handler.NewCustomAgentHandler))
 	must(container.Provide(handler.NewUserResourceFavoriteHandler))
-	must(container.Provide(service.NewSkillService))
-	must(container.Provide(handler.NewSkillHandler))
+	must(container.Provide(func(s *service.TenantSkillService) *handler.SkillHandler {
+		return handler.NewSkillHandler(s, s)
+	}))
 	must(container.Provide(handler.NewOrganizationHandler))
 	must(container.Provide(handler.NewMemoryHandler))
 
@@ -1611,6 +1638,8 @@ func registerWebSearchProviders(registry *infra_web_search.Registry) {
 	registry.Register("zhipu", infra_web_search.NewZhipuProvider)
 	registry.Register("exa", infra_web_search.NewExaProvider)
 	registry.Register("metaso", infra_web_search.NewMetasoProvider)
+	registry.Register("bocha", infra_web_search.NewBochaProvider)
+	registry.Register("brave", infra_web_search.NewBraveProvider)
 }
 
 // registerIMService registers adapter factories, loads enabled channels, and
@@ -1714,6 +1743,22 @@ func startHousekeepingService(svc *service.HousekeepingService, cleaner interfac
 		logger.Warnf(context.Background(), "[Container] housekeeping start failed: %v", err)
 	}
 	cleaner.RegisterWithName("KnowledgeHousekeeping", func() error {
+		svc.Stop()
+		return nil
+	})
+}
+
+// startTenantSkillReaper starts the stuck-install / orphan-snapshot cron and
+// registers cleanup. Best-effort: a startup error is logged but does NOT abort
+// the container — the rest of the system stays usable.
+func startTenantSkillReaper(svc *service.TenantSkillService, cleaner interfaces.ResourceCleaner) {
+	if svc == nil {
+		return
+	}
+	if err := svc.Start(context.Background()); err != nil {
+		logger.Warnf(context.Background(), "[Container] tenant skill reaper start failed: %v", err)
+	}
+	cleaner.RegisterWithName("TenantSkillReaper", func() error {
 		svc.Stop()
 		return nil
 	})
