@@ -74,6 +74,15 @@ const (
 	// streams, so the UI can show which memories the answer saw.
 	EventMemoryRecalled EventType = "memory_recalled"
 
+	// EventContextCompacted is emitted when older conversation was summarized
+	// away to fit the context window.
+	EventContextCompacted EventType = "context_compacted"
+
+	// EventUserMessageInjected is emitted when a message the user appended
+	// while the run was in flight was accepted into the running turn (see
+	// agent drainSteerMessages).
+	EventUserMessageInjected EventType = "user_message_injected"
+
 	// Session events
 	EventSessionTitle EventType = "session_title" // 会话标题更新
 
