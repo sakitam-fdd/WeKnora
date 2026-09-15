@@ -1,4 +1,4 @@
-name: One-shot Anthropic test repair
+name: One-shot final Go test repair
 
 on:
   push:
@@ -20,22 +20,49 @@ jobs:
           ref: fix/actions-20260915
           fetch-depth: 0
 
-      - name: Remove obsolete pre-upstream compatibility test
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: Repair stale merged tests
         shell: bash
         run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/Tencent/WeKnora.git
+          git fetch --no-tags upstream 90e3977714a08e25ccd4506e317fa9c062c9c372
+
+          git show 90e3977714a08e25ccd4506e317fa9c062c9c372:internal/agent/tools/knowledge_search_rerank_test.go \
+            > internal/agent/tools/knowledge_search_rerank_test.go
+
           python3 <<'PY'
           from pathlib import Path
 
-          p = Path('internal/models/chat/anthropic_test.go')
+          p = Path('internal/application/service/tenant_skill_install_test.go')
           s = p.read_text()
-          start = s.find('func TestAnthropicBuildRequestMergesConsecutiveMessageRoles(')
-          if start >= 0:
-              end = s.find('func TestAnthropicChat_CacheUsage(', start)
-              assert end > start
-              s = s[:start] + s[end:]
-              p.write_text(s)
+          old = '''func (s *installSessionService) SearchKnowledge(
+          \tcontext.Context, []string, []string, []types.TagScope, string,
+          ) ([]*types.SearchResult, error) {
+          \treturn nil, nil
+          }'''
+          new = '''func (s *installSessionService) SearchKnowledge(
+          \tcontext.Context, []string, []string, []types.TagScope, string, string,
+          ) ([]*types.SearchResult, error) {
+          \treturn nil, nil
+          }'''
+          assert old in s, 'installSessionService.SearchKnowledge old signature not found'
+          p.write_text(s.replace(old, new, 1))
           PY
-          gofmt -w internal/models/chat/anthropic_test.go
+
+          gofmt -w \
+            internal/agent/tools/knowledge_search_rerank_test.go \
+            internal/application/service/tenant_skill_install_test.go
+
+      - name: Verify targeted packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/agent/tools ./internal/application/service
 
       - name: Commit repair
         shell: bash
@@ -43,10 +70,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add internal/models/chat/anthropic_test.go
+          git add \
+            internal/agent/tools/knowledge_search_rerank_test.go \
+            internal/application/service/tenant_skill_install_test.go
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "test: drop obsolete Anthropic role-merging assertion"
+            git commit -m "test: align merged stubs with current interfaces"
             git push origin HEAD:fix/actions-20260915
           fi
