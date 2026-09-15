@@ -11,7 +11,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
-	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -123,14 +122,9 @@ func prepareMessagesWithHistory(chatManage *types.ChatManage) []chat.Message {
 
 	chatMessages = AppendHistoryMessages(chatMessages, chatManage.History)
 
-	// Image-output rules are turn-specific. Putting them on the current user
-	// message keeps the system prefix byte-stable so provider prompt caches
-	// still hit on later turns of the same session.
-	userContent := appendRetrievedImageOutputRequirement(chatManage.UserContent, chatManage.RenderedContexts)
-
 	// Add current user message. Only include images when the chat model supports
 	// vision; non-vision models rely on the text description in UserContent.
-	userMsg := chat.Message{Role: "user", Content: userContent}
+	userMsg := chat.Message{Role: "user", Content: chatManage.UserContent}
 	if chatManage.ChatModelSupportsVision && len(chatManage.Images) > 0 {
 		userMsg.Images = chatManage.Images
 	}

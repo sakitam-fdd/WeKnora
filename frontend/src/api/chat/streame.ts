@@ -114,6 +114,10 @@ export function useStream() {
       if (params.web_search_enabled !== undefined) {
         postBody.web_search_enabled = params.web_search_enabled;
       }
+      // Preserve the explicit browser choice when rebuilding the HTTP body.
+      if (params.local_browser_enabled !== undefined) {
+        postBody.local_browser_enabled = params.local_browser_enabled;
+      }
       // Include summary_model_id if provided (for non-Agent mode)
       if (params.summary_model_id) {
         postBody.summary_model_id = params.summary_model_id;
