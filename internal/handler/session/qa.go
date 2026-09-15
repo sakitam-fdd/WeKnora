@@ -54,6 +54,7 @@ type qaRequestContext struct {
 	skillNames            []string
 	summaryModelID        string
 	rerankModelID         string
+	localBrowserEnabled   bool
 	webSearchEnabled      bool
 	mentionedItems        types.MentionedItems
 	effectiveTenantID     uint64                   // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant

@@ -716,6 +716,7 @@ export default {
     deleteStatusUnavailable: '削除結果を確認できませんでした。後で更新してドキュメントのステータスを確認してください。',
     batchDeleteSuccess: '{count}件のドキュメントを削除しました',
     batchDeleteFailed: '一括削除に失敗しました',
+    batchDeletePartial: '{succeeded}件のドキュメントを削除し、{failed}件は失敗しました',
     batchTag: '一括タグ付け',
     batchTagDialogHeading: '一括タグ付け',
     batchTagSubtitle: '選択した{count}件のドキュメントにタグを設定します（既存のタグは置き換えられます）',
@@ -728,6 +729,7 @@ export default {
     confirmBatchReparse: '確定して再解析',
     batchReparseSuccess: '{count}件の再構築タスクを登録しました',
     batchReparseFailed: '一括再構築に失敗しました',
+    batchReparsePartial: '{succeeded}件の再構築タスクを登録し、{failed}件は失敗しました',
     batchReparseSkippedInFlight: '解析中の{count}件のドキュメントをスキップしました',
     statusCompleted: '完了',
     statusProcessing: '処理中',
@@ -917,6 +919,8 @@ export default {
       cancelled: 'キャンセル済み'
     },
     errorCode: {
+      MULTIMODAL_OCR_REQUIRED: 'スキャンPDFにはOCRが必要です',
+      MULTIMODAL_OCR_REQUIRED_SUGGESTION: '使用可能なテキストを抽出できませんでした。マルチモーダル処理を有効にしてVLM/OCRモデルを設定し、ドキュメントを再解析してください。',
       UNKNOWN_SUGGESTION: '詳細はアプリケーションログを確認してください。'
     }
   },
@@ -2359,6 +2363,8 @@ export default {
     passwordMismatch: '入力したパスワードが一致しません',
     loginError: 'ログインに失敗しました。メールアドレスまたはパスワードを確認してください',
     loginErrorRetry: 'ログインに失敗しました。しばらくしてから再試行してください',
+    loginRateLimited: 'ログイン試行回数が多すぎます。{seconds}秒後に再試行してください。',
+    loginRetryCountdown: '{seconds}秒後に再試行',
     registerError: '登録に失敗しました。しばらくしてから再試行してください',
     workspaceOnboarding: {
       title: 'ワークスペースを選択',

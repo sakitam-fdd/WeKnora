@@ -2119,41 +2119,64 @@ const openKnowledgeItem = (item: KnowledgeCard) => {
   openCardDetails(item);
 };
 
-const confirmBatchDelete = async () => {
-  if (batchDeleting.value || batchReparsing.value || selectedIds.value.size === 0) return;
-  const ids = Array.from(selectedIds.value);
+// Stop observing a previous KB when navigating, including away and back.
+let deleteGeneration = 0;
+watch(kbId, () => {
+  deleteGeneration++;
+  batchDeleting.value = false;
+});
+onUnmounted(() => { deleteGeneration++; });
+
+const deleteKnowledgeDocuments = async (
+  ids: string[],
+  submit: () => Promise<any>,
+  batch: boolean,
+) => {
+  if (batchDeleting.value || batchReparsing.value || ids.length === 0) return;
+  const targetKbId = kbId.value;
+  const generation = ++deleteGeneration;
+  const isActive = () => generation === deleteGeneration && isCurrentKb(targetKbId);
   batchDeleting.value = true;
   let submitted = false;
   try {
-    const { succeeded, failed, lastError } = await submitInBatches(ids, (chunk) =>
-      batchDeleteKnowledge(kbId.value, chunk),
-    );
-    if (succeeded.length === 0) {
-      MessagePlugin.error(lastError || t('knowledgeBase.batchDeleteFailed'));
+    const res = await submit();
+    if (!isActive()) return;
+    if (!res?.success) {
+      MessagePlugin.error(res?.message || t('knowledgeBase.batchDeleteFailed'));
       return;
     }
-    if (failed.length === 0) {
-      MessagePlugin.success(t('knowledgeBase.batchDeleteSuccess', { count: succeeded.length }));
+    submitted = true;
+    MessagePlugin.info(t('knowledgeBase.deleteSubmitted'));
+    if (batch) {
+      clearSelection();
+      batchMode.value = false;
+    }
+    const result = await waitForKnowledgeDeletion(
+      ids,
+      async (queryIds) => {
+        const query = new URLSearchParams();
+        queryIds.forEach(id => query.append('ids', id));
+        return await batchQueryKnowledge(query.toString(), targetKbId) as any;
+      },
+      { isActive },
+    );
+    if (!isActive() || result === 'cancelled') return;
+    if (result === 'completed') {
+      MessagePlugin.success(batch
+        ? t('knowledgeBase.batchDeleteSuccess', { count: ids.length })
+        : t('knowledgeBase.deleteSuccess'));
+    } else if (result === 'failed') {
+      MessagePlugin.error(t('knowledgeBase.deleteTaskFailed'));
     } else {
-      MessagePlugin.warning(
-        t('knowledgeBase.batchDeletePartial', { succeeded: succeeded.length, failed: failed.length }),
-      );
+      MessagePlugin.info(t('knowledgeBase.deletePending'));
     }
-    const deletedIdSet = new Set(succeeded);
-    clearSelection();
-    batchMode.value = false;
-    resetPage();
-    // 后端将批量删除放入异步队列，立刻拉列表仍可能包含待删项；短轮询直到列表与后端一致或超时
-    const maxPolls = 30;
-    const delayMs = 400;
-    for (let i = 0; i < maxPolls; i++) {
-      await loadKnowledgeFiles(kbId.value);
-      const stillPresent = (cardList.value || []).some((c: KnowledgeCard) => deletedIdSet.has(c.id));
-      if (!stillPresent) break;
-      await new Promise<void>((r) => setTimeout(r, delayMs));
+  } catch (e: any) {
+    if (!isActive()) return;
+    if (submitted) {
+      MessagePlugin.warning(t('knowledgeBase.deleteStatusUnavailable'));
+    } else {
+      MessagePlugin.error(e?.message || t('knowledgeBase.batchDeleteFailed'));
     }
-    loadTags(kbId.value, true);
-    void loadFolderTree(kbId.value);
   } finally {
     if (isActive()) {
       batchDeleting.value = false;

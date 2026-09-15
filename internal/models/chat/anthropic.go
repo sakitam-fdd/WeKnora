@@ -294,37 +294,35 @@ func (c *AnthropicChat) buildRequest(_ context.Context, messages []Message, opts
 		}
 	}
 
-	var systemParts []string
-	for _, msg := range messages {
-		content := strings.TrimSpace(msg.Content)
-		if content == "" {
-			content = textFromMultiContent(msg.MultiContent)
-		}
-		if content == "" {
-			continue
-		}
-		switch msg.Role {
-		case "system":
-			systemParts = append(systemParts, content)
-		default:
-			role := "user"
-			if msg.Role == "assistant" {
-				role = "assistant"
-			}
-			req.Messages = appendAnthropicMessage(req.Messages, role, content)
+	anthropicToolOptions(&req, opts)
+	systemParts, converted := anthropicMessages(messages)
+	req.Messages = converted
+
+	systemText := strings.Join(systemParts, "\n\n")
+	retention := resolveCacheRetention(opts)
+	marker := cacheControlFor(retention, "1h")
+	if marker == nil {
+		req.System = systemText
+		return req
+	}
+	if systemText != "" {
+		req.System = []anthropicContentBlock{{
+			Type:         "text",
+			Text:         systemText,
+			CacheControl: &anthropicCacheControl{Type: marker.Type, TTL: marker.TTL},
+		}}
+	}
+	if len(req.Messages) > 0 {
+		last := &req.Messages[len(req.Messages)-1]
+		if text, ok := last.Content.(string); ok && text != "" {
+			last.Content = []anthropicContentBlock{{
+				Type:         "text",
+				Text:         text,
+				CacheControl: &anthropicCacheControl{Type: marker.Type, TTL: marker.TTL},
+			}}
 		}
 	}
 	return req
-}
-
-// appendAnthropicMessage preserves the Messages API's alternating user and
-// assistant roles while retaining the original message order within a turn.
-func appendAnthropicMessage(messages []anthropicMessage, role, content string) []anthropicMessage {
-	if len(messages) > 0 && messages[len(messages)-1].Role == role {
-		messages[len(messages)-1].Content += "\n\n" + content
-		return messages
-	}
-	return append(messages, anthropicMessage{Role: role, Content: content})
 }
 
 func textFromMultiContent(parts []MessageContentPart) string {
