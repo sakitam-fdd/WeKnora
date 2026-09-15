@@ -1,0 +1,60 @@
+name: One-shot frontend type repair
+
+on:
+  push:
+    branches:
+      - fix/actions-20260915
+    paths:
+      - .github/workflows/repair-frontend-types-once.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/actions-20260915
+          fetch-depth: 0
+
+      - name: Repair dropped frontend fields
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path('frontend/src/api/chat/streame.ts')
+          s = p.read_text()
+          needle = 'agent_source_tenant_id?: string | number; web_search_enabled?: boolean;'
+          replacement = 'agent_source_tenant_id?: string | number; web_search_enabled?: boolean; local_browser_enabled?: boolean;'
+          if replacement not in s:
+              assert needle in s
+              s = s.replace(needle, replacement, 1)
+          p.write_text(s)
+
+          p = Path('frontend/src/views/auth/Login.vue')
+          s = p.read_text()
+          needle = 'const registrationEnabled = ref(true)\n'
+          replacement = 'const registrationEnabled = ref(true)\nconst complexPasswordEnabled = ref(false)\n'
+          if 'const complexPasswordEnabled = ref(false)' not in s:
+              assert needle in s
+              s = s.replace(needle, replacement, 1)
+          p.write_text(s)
+          PY
+
+      - name: Commit repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add frontend/src/api/chat/streame.ts frontend/src/views/auth/Login.vue
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "fix: restore frontend fields dropped by upstream merge"
+            git push origin HEAD:fix/actions-20260915
+          fi
