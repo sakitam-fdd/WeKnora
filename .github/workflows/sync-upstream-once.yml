@@ -1,0 +1,33 @@
+name: One-shot upstream sync
+
+on:
+  push:
+    branches:
+      - fix/actions-20260915
+    paths:
+      - .github/workflows/sync-upstream-once.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v6
+        with:
+          ref: fix/actions-20260915
+          fetch-depth: 0
+
+      - name: Merge Tencent upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Tencent/WeKnora.git
+          git fetch upstream main
+          git merge --no-edit -X ours upstream/main
+          git push origin HEAD:fix/actions-20260915
