@@ -1,0 +1,118 @@
+name: One-shot action repair runner v2
+
+on:
+  push:
+    branches:
+      - fix/actions-20260915
+    paths:
+      - .github/workflows/repair-actions-runner-v2.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/actions-20260915
+          fetch-depth: 0
+
+      - name: Apply merge repairs
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          # Reuse the four validated repairs from the first repair workflow.
+          workflow = Path('.github/workflows/repair-actions-once.yml').read_text()
+          body = workflow.split("python3 <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+          exec(compile(textwrap.dedent(body), 'repair-actions-once.yml', 'exec'))
+
+          # Restore an import dropped while keeping the fork's index-move support.
+          p = Path('internal/application/service/retriever/keywords_vector_hybrid_indexer.go')
+          s = p.read_text()
+          if '\t"fmt"\n' not in s:
+              needle = '\t"errors"\n'
+              assert needle in s
+              s = s.replace(needle, needle + '\t"fmt"\n', 1)
+          p.write_text(s)
+
+          # Remove the stale LLM-rerank implementation left by conflict resolution.
+          # Current upstream uses the configured rerank.Reranker and returns RankResult.
+          p = Path('internal/agent/tools/knowledge_search.go')
+          s = p.read_text()
+          start = s.index('func (t *KnowledgeSearchTool) rerankScores(')
+          end = s.index('func (t *KnowledgeSearchTool) rerankThreshold()', start)
+          replacement = r'''func (t *KnowledgeSearchTool) rerankScores(
+          ctx context.Context,
+          query string,
+          results []*searchResultWithMeta,
+          ) ([]rerank.RankResult, error) {
+          passages := make([]string, len(results))
+          for i, result := range results {
+              passages[i] = t.getEnrichedPassage(ctx, result.SearchResult)
+          }
+
+          rerankResp, err := t.rerankModel.Rerank(ctx, query, passages)
+          if err != nil {
+              return nil, fmt.Errorf("rerank call failed: %w", err)
+          }
+          return rerankResp, nil
+          }
+
+          '''
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+          PY
+          gofmt -w \
+            internal/config/config.go \
+            internal/models/chat/anthropic.go \
+            internal/application/service/retriever/keywords_vector_hybrid_indexer.go \
+            internal/agent/tools/knowledge_search.go
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Verify dsh Go contracts
+        run: go test ./packages/dsh-weknora/contract/...
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run type-check
+          npm run build
+
+      - name: Commit repaired code
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            internal/config/config.go \
+            internal/models/chat/anthropic.go \
+            internal/application/service/retriever/keywords_vector_hybrid_indexer.go \
+            internal/agent/tools/knowledge_search.go \
+            frontend/src/views/knowledge/KnowledgeBase.vue \
+            frontend/src/i18n/locales/ja-JP.ts
+          if git diff --cached --quiet; then
+            echo "No code changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: repair upstream sync conflicts and CI failures"
+          git push origin HEAD:fix/actions-20260915
