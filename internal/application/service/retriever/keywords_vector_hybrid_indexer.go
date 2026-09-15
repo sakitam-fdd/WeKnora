@@ -3,6 +3,7 @@ package retriever
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"

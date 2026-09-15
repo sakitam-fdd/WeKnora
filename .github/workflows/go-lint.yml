@@ -1,10 +1,15 @@
 name: Go Lint
 
 # The repository carries a large backlog of pre-existing golangci-lint findings,
-# so pull requests are only judged on the code they introduce (`only-new-issues`).
-# That filter needs a pull request diff, which is why this workflow has no other
-# trigger; the companion go-lint-cache.yml keeps the caches this job restores
-# from warm on main.
+# so pull requests are only judged on the code they introduce. Do this from the
+# local git history instead of golangci-lint-action's `only-new-issues` helper:
+# that helper downloads the PR as one GitHub diff and fails for PRs with more
+# than 300 changed files (common for upstream-sync PRs).
+#
+# A large upstream-sync PR is a special case: the old fork base makes every
+# imported upstream commit look "new", including upstream's accepted lint
+# backlog. When a >300-file PR contains a first-parent merge, use the first such
+# merge as the lint baseline. Normal PRs continue to use the PR base SHA.
 
 on:
   pull_request:
@@ -38,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       modules: ${{ steps.detect.outputs.modules }}
+      lint_base: ${{ steps.detect.outputs.lint_base }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -46,7 +52,25 @@ jobs:
         id: detect
         shell: bash
         run: |
-          diff_range="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          diff_range="${base}...${head}"
+
+          # GitHub's single PR-diff endpoint is capped at 300 files. For a
+          # large upstream merge, imported upstream code is baseline rather
+          # than fork-authored code, so start linting from that merge commit.
+          lint_base="$base"
+          changed_count=$(git diff --name-only --diff-filter=ACMR "$diff_range" | wc -l | tr -d '[:space:]')
+          if [ "$changed_count" -gt 300 ]; then
+            sync_merge=$(git rev-list --reverse --first-parent --merges "${base}..${head}" | head -n 1 || true)
+            if [ -n "$sync_merge" ]; then
+              lint_base="$sync_merge"
+              echo "Large merge PR (${changed_count} files); lint baseline: ${lint_base}"
+            fi
+          fi
+          echo "lint_base=${lint_base}" >> "$GITHUB_OUTPUT"
+
           modules=()
           if git diff --name-only --diff-filter=ACMR "$diff_range" -- \
                .golangci.yml .github/workflows/go-lint.yml | grep -q .; then
@@ -101,4 +125,4 @@ jobs:
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           working-directory: ${{ matrix.module }}
-          only-new-issues: true
+          args: --new-from-rev=${{ needs.changes.outputs.lint_base }}

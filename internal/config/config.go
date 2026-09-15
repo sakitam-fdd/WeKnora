@@ -279,7 +279,8 @@ type AuthConfig struct {
 	// create_personal preserves the historical one-user-one-workspace default;
 	// tenantless creates only the identity and waits for an invitation or an
 	// explicit self-service tenant creation.
-	DefaultTenantMode string `yaml:"default_tenant_mode" json:"default_tenant_mode"`
+	DefaultTenantMode      string `yaml:"default_tenant_mode" json:"default_tenant_mode"`
+	ComplexPasswordEnabled bool   `yaml:"complex_password_enabled" json:"complex_password_enabled"`
 	// LoginRateLimitMax is the maximum number of password-login requests that
 	// one client IP may make during LoginRateLimitWindowMinutes. It is enabled by
 	// default to bound online password guessing.
