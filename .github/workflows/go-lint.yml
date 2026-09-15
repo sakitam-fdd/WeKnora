@@ -1,10 +1,10 @@
 name: Go Lint
 
 # The repository carries a large backlog of pre-existing golangci-lint findings,
-# so pull requests are only judged on the code they introduce (`only-new-issues`).
-# That filter needs a pull request diff, which is why this workflow has no other
-# trigger; the companion go-lint-cache.yml keeps the caches this job restores
-# from warm on main.
+# so pull requests are only judged on the code they introduce. Do this from the
+# local git history instead of golangci-lint-action's `only-new-issues` helper:
+# that helper downloads the PR as one GitHub diff and fails for PRs with more
+# than 300 changed files (common for upstream-sync PRs).
 
 on:
   pull_request:
@@ -101,4 +101,4 @@ jobs:
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
           working-directory: ${{ matrix.module }}
-          only-new-issues: true
+          args: --new-from-rev=${{ github.event.pull_request.base.sha }}
