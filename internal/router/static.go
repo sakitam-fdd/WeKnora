@@ -51,7 +51,13 @@ func serveFrontendStatic(r *gin.Engine) {
 		// Embed pages need the dedicated entry point and the channel CSP set by
 		// embedFrameAncestorsMiddleware. Keep the main SPA same-origin only.
 		if strings.HasPrefix(path, "/embed/") {
-			c.File(filepath.Join(absDir, "embed.html"))
+			if !hasEmbedIndex {
+				c.Status(http.StatusNotFound)
+				c.Abort()
+				return
+			}
+			setFrontendCacheHeaders(c.Writer, "/embed.html")
+			c.File(embedIndexPath)
 			c.Abort()
 			return
 		}
@@ -61,17 +67,6 @@ func serveFrontendStatic(r *gin.Engine) {
 		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
 			setFrontendCacheHeaders(c.Writer, path)
 			fileServer.ServeHTTP(c.Writer, c.Request)
-			c.Abort()
-			return
-		}
-		if strings.HasPrefix(path, "/embed/") {
-			if !hasEmbedIndex {
-				c.Status(http.StatusNotFound)
-				c.Abort()
-				return
-			}
-			setFrontendCacheHeaders(c.Writer, "/embed.html")
-			c.File(embedIndexPath)
 			c.Abort()
 			return
 		}
