@@ -21,7 +21,7 @@ jobs:
           ref: fix/actions-20260915
           fetch-depth: 0
 
-      - name: Apply merge repairs
+      - name: Apply confirmed merge repairs
         shell: bash
         run: |
           python3 <<'PY'
@@ -76,6 +76,19 @@ jobs:
               assert needle in s
               s = s.replace(needle, needle + '\t"github.com/Tencent/WeKnora/internal/searchutil"\n', 1)
           p.write_text(s)
+
+          # Restore the upstream local-browser request field dropped by the merge.
+          p = Path('internal/handler/session/qa.go')
+          s = p.read_text()
+          if '\tlocalBrowserEnabled   bool\n' not in s:
+              needle = '\trerankModelID         string\n\twebSearchEnabled      bool\n'
+              assert needle in s
+              s = s.replace(
+                  needle,
+                  '\trerankModelID         string\n\tlocalBrowserEnabled   bool\n\twebSearchEnabled      bool\n',
+                  1,
+              )
+          p.write_text(s)
           PY
 
           gofmt -w \
@@ -83,7 +96,30 @@ jobs:
             internal/models/chat/anthropic.go \
             internal/application/service/retriever/keywords_vector_hybrid_indexer.go \
             internal/agent/tools/knowledge_search.go \
-            internal/application/service/chat_pipeline/common.go
+            internal/application/service/chat_pipeline/common.go \
+            internal/handler/session/qa.go
+
+      - name: Persist confirmed repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            internal/config/config.go \
+            internal/models/chat/anthropic.go \
+            internal/application/service/retriever/keywords_vector_hybrid_indexer.go \
+            internal/agent/tools/knowledge_search.go \
+            internal/application/service/chat_pipeline/common.go \
+            internal/handler/session/qa.go \
+            frontend/src/views/knowledge/KnowledgeBase.vue \
+            frontend/src/i18n/locales/ja-JP.ts
+          if git diff --cached --quiet; then
+            echo "No code changes to commit"
+          else
+            git commit -m "fix: repair upstream sync conflicts and CI failures"
+            git push origin HEAD:fix/actions-20260915
+          fi
 
       - uses: actions/setup-go@v6
         with:
@@ -114,24 +150,3 @@ jobs:
             --build-arg VITE_FRONTEND_COMMIT="${GITHUB_SHA::7}" \
             -t weknora-ui:ci \
             frontend/
-
-      - name: Commit repaired code
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add \
-            internal/config/config.go \
-            internal/models/chat/anthropic.go \
-            internal/application/service/retriever/keywords_vector_hybrid_indexer.go \
-            internal/agent/tools/knowledge_search.go \
-            internal/application/service/chat_pipeline/common.go \
-            frontend/src/views/knowledge/KnowledgeBase.vue \
-            frontend/src/i18n/locales/ja-JP.ts
-          if git diff --cached --quiet; then
-            echo "No code changes to commit"
-            exit 0
-          fi
-          git commit -m "fix: repair upstream sync conflicts and CI failures"
-          git push origin HEAD:fix/actions-20260915
