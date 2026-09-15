@@ -204,7 +204,7 @@ instance.interceptors.response.use(
       errorMessage = data;
     }
     const retryAfter = error.response.headers?.['retry-after'];
-    return Promise.reject({ 
+    return Promise.reject(withHttpStatus({ 
       status, 
       message: errorMessage,
       retryAfter,
