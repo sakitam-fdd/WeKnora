@@ -56,7 +56,12 @@ func serveFrontendStatic(r *gin.Engine) {
 				c.Abort()
 				return
 			}
-			setFrontendCacheHeaders(c.Writer, "/embed.html")
+			// The embed security middleware may already have set a stronger cache
+			// policy (currently no-store). Preserve it; only apply the static-file
+			// default when this middleware is used on its own.
+			if c.Writer.Header().Get("Cache-Control") == "" {
+				setFrontendCacheHeaders(c.Writer, "/embed.html")
+			}
 			c.File(embedIndexPath)
 			c.Abort()
 			return
