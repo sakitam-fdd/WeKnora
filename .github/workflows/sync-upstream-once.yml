@@ -29,5 +29,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/Tencent/WeKnora.git
           git fetch upstream main
-          git merge --no-edit -X ours upstream/main
+          git merge --no-commit -X ours upstream/main
+          # GITHUB_TOKEN cannot push a merge commit that changes workflow files.
+          # Keep this fork's workflows here; they are reviewed/synced separately.
+          git restore --source=HEAD --staged --worktree .github/workflows
+          git commit --no-edit
           git push origin HEAD:fix/actions-20260915
