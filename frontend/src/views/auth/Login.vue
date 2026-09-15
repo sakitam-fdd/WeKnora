@@ -425,6 +425,7 @@ const oidcProviderName = ref('')
 // link is visible; the actual mode is fetched from /auth/config in onMounted.
 // In invite_only mode the link/card are hidden.
 const registrationEnabled = ref(true)
+const complexPasswordEnabled = ref(false)
 const loginRetryAfterSeconds = ref(0)
 let loginRetryTimer: ReturnType<typeof setInterval> | undefined
 const loginLocked = computed(() => loginRetryAfterSeconds.value > 0)
