@@ -47,6 +47,7 @@ jobs:
           npm run type-check
           npm run build
 
+      # Keep the Docker path covered too; the original Frontend workflow failed here.
       - name: Verify frontend Docker image
         run: |
           docker build \
