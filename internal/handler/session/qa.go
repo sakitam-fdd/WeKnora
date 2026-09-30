@@ -421,15 +421,15 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 
 	// Build request context
 	reqCtx := &qaRequestContext{
-		ctx:         ctx,
-		c:           c,
-		sessionID:   sessionID,
-		requestID:   requestID,
-		receivedAt:  receivedAt,
+		ctx:           ctx,
+		c:             c,
+		sessionID:     sessionID,
+		requestID:     requestID,
+		receivedAt:    receivedAt,
 		query:         request.Query,
 		promptContext: request.PromptContext,
 		session:       session,
-		customAgent: customAgent,
+		customAgent:   customAgent,
 		assistantMessage: &types.Message{
 			SessionID:        sessionID,
 			Role:             "assistant",
