@@ -1,4 +1,4 @@
-name: Upstream sync diagnostic
+name: Resolve upstream sync
 
 on:
   push:
@@ -6,30 +6,60 @@ on:
       - sync/resolve-upstream-20260930
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose:
+  resolve:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
-      - name: Attempt upstream merge and list conflicts
+      - name: Merge current upstream and push resolved branch
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git remote add upstream https://github.com/Tencent/WeKnora.git
           git fetch upstream main
+          git checkout -B sync/merged-upstream-20260930 origin/main
+
+          cp .github/workflows/go-lint.yml /tmp/go-lint.yml
+
           set +e
           git merge --no-commit --no-ff upstream/main
-          rc=$?
+          merge_rc=$?
           set -e
-          echo "merge_exit_code=$rc"
-          echo "=== CONFLICT FILES ==="
-          git diff --name-only --diff-filter=U || true
-          echo "=== STATUS ==="
+
+          if [ "$merge_rc" -ne 0 ]; then
+            while IFS= read -r file; do
+              [ -n "$file" ] || continue
+              case "$file" in
+                ".github/workflows/go-lint.yml")
+                  cp /tmp/go-lint.yml "$file"
+                  git add -- "$file"
+                  ;;
+                "docs/RBAC说明.md"|"docs/api/chat.md"|"internal/models/embedding/openai.go"|"internal/models/embedding/openai_test.go")
+                  git rm -f -- "$file"
+                  ;;
+                *)
+                  git checkout --theirs -- "$file"
+                  git add -- "$file"
+                  ;;
+              esac
+            done < <(git diff --name-only --diff-filter=U)
+          fi
+
+          unresolved="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$unresolved" ]; then
+            echo "Unresolved conflicts:"
+            echo "$unresolved"
+            exit 1
+          fi
+
           git status --short
-          exit 0
+          git commit -m "chore: merge upstream Tencent/WeKnora (2026-09-30)"
+          git push origin HEAD:refs/heads/sync/merged-upstream-20260930
