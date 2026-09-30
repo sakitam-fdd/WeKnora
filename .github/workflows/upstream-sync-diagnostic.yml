@@ -35,8 +35,8 @@ jobs:
           set -e
 
           if [ "$merge_rc" -ne 0 ]; then
-            git diff --name-only --diff-filter=U > /tmp/upstream-conflicts.txt
-            while IFS= read -r file; do
+            git diff --name-only -z --diff-filter=U > /tmp/upstream-conflicts.bin
+            while IFS= read -r -d '' file; do
               [ -n "$file" ] || continue
               case "$file" in
                 ".github/workflows/go-lint.yml")
@@ -51,7 +51,7 @@ jobs:
                   git add -- "$file"
                   ;;
               esac
-            done < /tmp/upstream-conflicts.txt
+            done < /tmp/upstream-conflicts.bin
           fi
 
           unresolved="$(git diff --name-only --diff-filter=U)"
