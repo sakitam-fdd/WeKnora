@@ -44,6 +44,7 @@ type qaRequestContext struct {
 	requestID             string
 	receivedAt            time.Time // Wall-clock time the handler started processing the request
 	query                 string
+	promptContext         string // LLM-only context; never merged into the retrieval query or persisted Message.Content
 	session               *types.Session
 	customAgent           *types.CustomAgent
 	assistantMessage      *types.Message
@@ -107,6 +108,7 @@ func (rc *qaRequestContext) buildQARequest() *types.QARequest {
 	req := &types.QARequest{
 		Session:             rc.session,
 		Query:               rc.query,
+		QuotedContext:       rc.promptContext,
 		AssistantMessageID:  rc.assistantMessage.ID,
 		SummaryModelID:      rc.summaryModelID,
 		ReasoningEffort:     rc.reasoningEffort,
@@ -196,8 +198,11 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		request.Images[i].Caption = ""
 	}
 
-	// Log request details
-	if requestJSON, err := json.Marshal(request); err == nil {
+	// Log request details. Host-provided prompt context may contain page-local data,
+	// so keep it out of application logs while preserving it for the LLM prompt.
+	requestForLog := request
+	requestForLog.PromptContext = ""
+	if requestJSON, err := json.Marshal(requestForLog); err == nil {
 		logger.Infof(ctx, "[%s] Request: session_id=%s, request=%s",
 			logPrefix, sessionID, secutils.SanitizeForLog(secutils.CompactImageDataURLForLog(string(requestJSON))))
 	}
@@ -416,14 +421,15 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 
 	// Build request context
 	reqCtx := &qaRequestContext{
-		ctx:         ctx,
-		c:           c,
-		sessionID:   sessionID,
-		requestID:   requestID,
-		receivedAt:  receivedAt,
-		query:       request.Query,
-		session:     session,
-		customAgent: customAgent,
+		ctx:           ctx,
+		c:             c,
+		sessionID:     sessionID,
+		requestID:     requestID,
+		receivedAt:    receivedAt,
+		query:         request.Query,
+		promptContext: request.PromptContext,
+		session:       session,
+		customAgent:   customAgent,
 		assistantMessage: &types.Message{
 			SessionID:        sessionID,
 			Role:             "assistant",

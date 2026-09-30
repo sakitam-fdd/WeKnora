@@ -587,11 +587,42 @@ const awaitBatchReparseReflection = async (ids: string[]) => {
   pendingReparseAck.value.clear();
 };
 
+// The backend batch delete/reparse endpoints reject more than 200 ids per
+// request (maxBatch). Split larger selections into chunks and submit them
+// sequentially so big selections don't fail with a 400 error.
+const BATCH_SUBMIT_SIZE = 200;
+const submitInBatches = async (
+  ids: string[],
+  submit: (chunk: string[]) => Promise<any>,
+): Promise<{ succeeded: string[]; failed: string[]; lastError?: string }> => {
+  const succeeded: string[] = [];
+  const failed: string[] = [];
+  let lastError: string | undefined;
+  for (let i = 0; i < ids.length; i += BATCH_SUBMIT_SIZE) {
+    const chunk = ids.slice(i, i + BATCH_SUBMIT_SIZE);
+    try {
+      const res: any = await submit(chunk);
+      if (res?.success) {
+        succeeded.push(...chunk);
+      } else {
+        failed.push(...chunk);
+        lastError = res?.message;
+      }
+    } catch (e: any) {
+      failed.push(...chunk);
+      lastError = e?.message;
+    }
+  }
+  return { succeeded, failed, lastError };
+};
+
 const confirmBatchReparse = async () => {
   if (batchReparsing.value || batchDeleting.value || batchDownloading.value || selectedIds.value.size === 0) return;
   const allIds = Array.from(selectedIds.value);
+  // Index by id first to avoid O(N×M) lookups on large selections
+  const cardById = new Map((cardList.value || []).map((c: KnowledgeCard) => [c.id, c]));
   const ids = allIds.filter((id) => {
-    const item = cardList.value.find((c) => c.id === id);
+    const item = cardById.get(id);
     return !item || !isParseInFlight(item.parse_status);
   });
   const skipped = allIds.length - ids.length;
@@ -604,19 +635,25 @@ const confirmBatchReparse = async () => {
   }
   batchReparsing.value = true;
   try {
-    const res: any = await batchReparseKnowledge(kbId.value, ids);
-    if (res?.success) {
-      MessagePlugin.success(t('knowledgeBase.batchReparseSuccess', { count: ids.length }));
-      applyOptimisticBatchReparse(ids);
-      clearSelection();
-      batchMode.value = false;
-      scheduleWikiStatusProbes();
-      void awaitBatchReparseReflection(ids);
-    } else {
-      MessagePlugin.error(res?.message || t('knowledgeBase.batchReparseFailed'));
+    const { succeeded, failed, lastError } = await submitInBatches(ids, (chunk) =>
+      batchReparseKnowledge(kbId.value, chunk),
+    );
+    if (succeeded.length === 0) {
+      MessagePlugin.error(lastError || t('knowledgeBase.batchReparseFailed'));
+      return;
     }
-  } catch (e: any) {
-    MessagePlugin.error(e?.message || t('knowledgeBase.batchReparseFailed'));
+    if (failed.length === 0) {
+      MessagePlugin.success(t('knowledgeBase.batchReparseSuccess', { count: succeeded.length }));
+    } else {
+      MessagePlugin.warning(
+        t('knowledgeBase.batchReparsePartial', { succeeded: succeeded.length, failed: failed.length }),
+      );
+    }
+    applyOptimisticBatchReparse(succeeded);
+    clearSelection();
+    batchMode.value = false;
+    scheduleWikiStatusProbes();
+    void awaitBatchReparseReflection(succeeded);
   } finally {
     batchReparsing.value = false;
   }

@@ -222,9 +222,11 @@ instance.interceptors.response.use(
     } else if (typeof data === 'string') {
       errorMessage = data;
     }
-    return Promise.reject(withHttpStatus({
-      status,
+    const retryAfter = error.response.headers?.['retry-after'];
+    return Promise.reject(withHttpStatus({ 
+      status, 
       message: errorMessage,
+      retryAfter,
       ...(typeof data === 'object' ? data : {}) 
     }, status));
   }
