@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -30,7 +31,7 @@ func prepareMessagesWithModelContext(
 		return messages, registry
 	}
 
-	ordered := orderedPipelineReferences(chatManage)
+	ordered := expandCitationSources(orderedPipelineReferences(chatManage))
 	knowledgeResults := make([]*types.SearchResult, 0, len(ordered))
 	knowledgeRows := make([]map[string]interface{}, 0, len(ordered))
 	webRows := make([]map[string]interface{}, 0)
@@ -80,7 +81,8 @@ func prepareMessagesWithModelContext(
 	}
 	modelContexts := strings.Join(contextParts, "\n")
 	if strings.TrimSpace(modelContexts) == "" {
-		return messages, registry
+		modelContexts = "Retrieved source bodies could not be verified. Do not cite or infer facts from " +
+			"unavailable retrieval evidence."
 	}
 
 	// Context templates may have rendered {{contexts}} into the current user
@@ -139,4 +141,17 @@ func firstPipelineTitle(result *types.SearchResult) string {
 		return result.KnowledgeTitle
 	}
 	return result.KnowledgeFilename
+}
+
+// reportModelContextLeaks logs any durable identifier that survived encoding
+// so the producing prompt or tool can be fixed; see modelcontext/leaks.go.
+func reportModelContextLeaks(
+	ctx context.Context, scope string, registry *modelcontext.Registry, messages []chat.Message,
+) {
+	leaks := registry.LeakedIdentifiers(messages)
+	if len(leaks) == 0 {
+		return
+	}
+	logger.Warnf(ctx, "[%s][ModelContext] %d message field(s) carry raw identifiers after encoding: %s",
+		scope, len(leaks), modelcontext.SummarizeLeaks(leaks))
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/middleware"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -21,19 +19,24 @@ import (
 
 type stubSearchSessionService struct {
 	interfaces.SessionService
-	err error
+	calls    int
+	lastOpts *types.KnowledgeSearchOptions
 }
 
 func (s *stubSearchSessionService) SearchKnowledge(
-	_ context.Context, _ []string, _ []string, _ []types.TagScope, _ string, _ string,
-) ([]*types.SearchResult, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	return []*types.SearchResult{{
-		Content:   "chunk ![c](" + testResourceHandle + ")",
-		ImageInfo: `[{"url":"` + testResourceHandle + `"}]`,
-	}}, nil
+	_ context.Context, _ []string, _ []string, _ []types.TagScope, _ string, opts *types.KnowledgeSearchOptions,
+) (*types.RetrievalResult, error) {
+	s.calls++
+	s.lastOpts = opts
+	return &types.RetrievalResult{
+		Results: []*types.SearchResult{{
+			Content:   "chunk ![c](" + testResourceHandle + ")",
+			ImageInfo: `[{"url":"` + testResourceHandle + `"}]`,
+		}},
+		Meta: types.RetrievalMeta{Rerank: &types.RerankDiagnostics{
+			Applied: true, Outcome: types.RerankOutcomeOK, ModelID: "rr-1", ModelSource: types.RerankModelSourceTenant,
+		}},
+	}, nil
 }
 
 func TestSearchKnowledge_PublicResourceURLs(t *testing.T) {
@@ -105,43 +108,68 @@ func TestSearchKnowledge_DefaultKeepsHandles(t *testing.T) {
 	assert.Contains(t, resp.Data[0].Content, testResourceHandle)
 }
 
-func setupSearchKnowledgeRouter(err error) *httptest.ResponseRecorder {
+func performKnowledgeSearch(t *testing.T, svc *stubSearchSessionService, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(middleware.ErrorHandler())
-	h := &Handler{
-		sessionService: &stubSearchSessionService{err: err},
-		fileService:    &stubResourceFileService{},
-	}
+	h := &Handler{sessionService: svc, fileService: &stubResourceFileService{}}
 	r.POST("/knowledge-search", h.SearchKnowledge)
-
-	body := bytes.NewBufferString(`{"query":"diagram","knowledge_base_ids":["kb-1"]}`)
-	req := httptest.NewRequest(http.MethodPost, "/knowledge-search", body)
+	req := httptest.NewRequest(http.MethodPost, "/knowledge-search", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
 }
 
-func TestSearchKnowledge_TypedForbiddenErrorPreserved(t *testing.T) {
-	w := setupSearchKnowledgeRouter(
-		apperrors.NewForbiddenError("rerank model not found or not accessible"))
+func TestSearchKnowledge_PassesRetrievalOverridesAndReturnsMeta(t *testing.T) {
+	svc := &stubSearchSessionService{}
+	w := performKnowledgeSearch(t, svc, `{
+		"query":"q","knowledge_base_ids":["kb-1"],
+		"vector_threshold":0.4,"keyword_threshold":0,"match_count":7,"disable_keywords_match":true,
+		"rerank":{"enabled":false}
+	}`)
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 
-	require.Equal(t, http.StatusForbidden, w.Code, "body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), "rerank model not found or not accessible")
+	opts := svc.lastOpts
+	require.NotNil(t, opts)
+	require.NotNil(t, opts.VectorThreshold)
+	require.NotNil(t, opts.KeywordThreshold, "an explicit 0 must survive as an override")
+	assert.Equal(t, 0.4, *opts.VectorThreshold)
+	assert.Equal(t, 0.0, *opts.KeywordThreshold)
+	assert.Equal(t, 7, opts.MatchCount)
+	assert.True(t, opts.DisableKeywordsMatch)
+	require.NotNil(t, opts.Rerank)
+	assert.False(t, opts.Rerank.IsEnabled())
+
+	var body struct {
+		Meta types.RetrievalMeta `json:"meta"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.NotNil(t, body.Meta.Rerank)
+	assert.Equal(t, types.RerankOutcomeOK, body.Meta.Rerank.Outcome)
+	assert.Equal(t, types.RerankModelSourceTenant, body.Meta.Rerank.ModelSource)
 }
 
-func TestSearchKnowledge_TypedBadRequestErrorPreserved(t *testing.T) {
-	w := setupSearchKnowledgeRouter(
-		apperrors.NewBadRequestError("rerank_model_id matches multiple models"))
-
-	require.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), "rerank_model_id matches multiple models")
+func TestSearchKnowledge_OmittedOverridesKeepTenantConfig(t *testing.T) {
+	svc := &stubSearchSessionService{}
+	w := performKnowledgeSearch(t, svc, `{"query":"q","knowledge_base_ids":["kb-1"]}`)
+	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	require.NotNil(t, svc.lastOpts)
+	assert.Equal(t, types.KnowledgeSearchOptions{}, *svc.lastOpts)
 }
 
-func TestSearchKnowledge_GenericErrorFlattenedTo500(t *testing.T) {
-	w := setupSearchKnowledgeRouter(errors.New("db down"))
-
-	require.Equal(t, http.StatusInternalServerError, w.Code, "body=%s", w.Body.String())
-	assert.Contains(t, w.Body.String(), `"code":1007`)
+func TestSearchKnowledge_RejectsInvalidOverrides(t *testing.T) {
+	for name, extra := range map[string]string{
+		"negative match_count":  `"match_count":-1`,
+		"both recall paths off": `"disable_keywords_match":true,"disable_vector_match":true`,
+		"negative rerank top_k": `"rerank":{"top_k":-2}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := &stubSearchSessionService{}
+			w := performKnowledgeSearch(t, svc, `{"query":"q","knowledge_base_ids":["kb-1"],`+extra+`}`)
+			require.Equal(t, http.StatusBadRequest, w.Code, "body=%s", w.Body.String())
+			assert.Zero(t, svc.calls)
+		})
+	}
 }
