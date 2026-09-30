@@ -199,7 +199,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 	}
 
 	// Log request details. Host-provided prompt context may contain page-local data,
-	// so preserve the old fork behavior and avoid writing it to application logs.
+	// so keep it out of application logs while preserving it for the LLM prompt.
 	requestForLog := request
 	requestForLog.PromptContext = ""
 	if requestJSON, err := json.Marshal(requestForLog); err == nil {
