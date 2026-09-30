@@ -517,8 +517,8 @@ func TestContinueStream_MultipleDataLinesReassemble(t *testing.T) {
 	}
 }
 
-// TestAppendSSEData unit-tests the shared SSE data-line accumulation helper.
-func TestAppendSSEData(t *testing.T) {
+// TestAppendSSEDataLine unit-tests the shared SSE data-line accumulation helpers.
+func TestAppendSSEDataLine(t *testing.T) {
 	tests := []struct {
 		name      string
 		buf, line string
@@ -526,13 +526,14 @@ func TestAppendSSEData(t *testing.T) {
 	}{
 		{"first line strips one leading space", "", "data: {\"a\":1}", `{"a":1}`},
 		{"first line without space", "", "data:{\"a\":1}", `{"a":1}`},
-		{"second line joined with newline", `{"a":1,`, "data: \"b\":2}", "{\"a\":1,\n\"b\":2}"},
+		{"second line joined with newline", "{\"a\":1,\n", "data: \"b\":2}", "{\"a\":1,\n\"b\":2}"},
 		{"empty data line yields empty buffer", "", "data:", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := appendSSEData(tt.buf, tt.line); got != tt.want {
-				t.Fatalf("appendSSEData(%q, %q) = %q, want %q", tt.buf, tt.line, got, tt.want)
+			got := completeSSEData(appendSSEDataLine(tt.buf, tt.line))
+			if got != tt.want {
+				t.Fatalf("completeSSEData(appendSSEDataLine(%q, %q)) = %q, want %q", tt.buf, tt.line, got, tt.want)
 			}
 		})
 	}
