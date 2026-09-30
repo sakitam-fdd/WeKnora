@@ -1,0 +1,35 @@
+name: Upstream sync diagnostic
+
+on:
+  push:
+    branches:
+      - sync/resolve-upstream-20260930
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Attempt upstream merge and list conflicts
+        shell: bash
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Tencent/WeKnora.git
+          git fetch upstream main
+          set +e
+          git merge --no-commit --no-ff upstream/main
+          rc=$?
+          set -e
+          echo "merge_exit_code=$rc"
+          echo "=== CONFLICT FILES ==="
+          git diff --name-only --diff-filter=U || true
+          echo "=== STATUS ==="
+          git status --short
+          exit 0
