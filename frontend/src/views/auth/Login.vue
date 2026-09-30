@@ -203,22 +203,17 @@
               label-align="top">
               <t-form-item :label="$t('auth.email')" name="email">
                 <t-input v-model="formData.email" :placeholder="$t('auth.emailPlaceholder')" type="text"
-                  autocomplete="email" size="large" :disabled="loading || loginLocked" />
+                  autocomplete="email" size="large" :disabled="loading" />
               </t-form-item>
 
               <t-form-item :label="$t('auth.password')" name="password">
                 <t-input v-model="formData.password" :placeholder="$t('auth.passwordPlaceholder')" type="password"
-                  autocomplete="current-password" size="large" :disabled="loading || loginLocked" @enter="handleLogin" />
+                  autocomplete="current-password" size="large" :disabled="loading" @enter="handleLogin" />
               </t-form-item>
 
-              <t-button type="submit" theme="primary" size="large" block :loading="loading" :disabled="loginLocked" class="submit-button">
-                {{ loading ? $t('auth.loggingIn') : (loginLocked ? $t('auth.loginRetryCountdown', { seconds: loginRetryAfterSeconds }) : $t('auth.login')) }}
+              <t-button type="submit" theme="primary" size="large" block :loading="loading" class="submit-button">
+                {{ loading ? $t('auth.loggingIn') : $t('auth.login') }}
               </t-button>
-
-              <div v-if="loginLocked" class="login-rate-limit-notice" role="alert" aria-live="polite">
-                <t-icon name="time" />
-                <span>{{ $t('auth.loginRateLimited', { seconds: loginRetryAfterSeconds }) }}</span>
-              </div>
 
               <div class="register-cta" v-if="registrationEnabled">
                 <div class="register-cta__divider">
@@ -426,29 +421,6 @@ const oidcProviderName = ref('')
 // In invite_only mode the link/card are hidden.
 const registrationEnabled = ref(true)
 const complexPasswordEnabled = ref(false)
-const loginRetryAfterSeconds = ref(0)
-let loginRetryTimer: ReturnType<typeof setInterval> | undefined
-const loginLocked = computed(() => loginRetryAfterSeconds.value > 0)
-
-const clearLoginRetryTimer = () => {
-  if (loginRetryTimer) {
-    clearInterval(loginRetryTimer)
-    loginRetryTimer = undefined
-  }
-}
-
-const startLoginRetryCountdown = (retryAfter: string | number | undefined) => {
-  const seconds = Number.parseInt(String(retryAfter), 10)
-  loginRetryAfterSeconds.value = Number.isFinite(seconds) && seconds > 0 ? seconds : 60
-  clearLoginRetryTimer()
-  loginRetryTimer = setInterval(() => {
-    loginRetryAfterSeconds.value -= 1
-    if (loginRetryAfterSeconds.value <= 0) {
-      loginRetryAfterSeconds.value = 0
-      clearLoginRetryTimer()
-    }
-  }, 1000)
-}
 
 // invite-link state. When the URL carries ?token=xxx we resolve it to
 // the originating tenant + role and switch the form into a "register
@@ -570,7 +542,6 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleClickOutside)
-  clearLoginRetryTimer()
 })
 
 const persistLoginResponse = async (response: any, skipRedirect = false) => {
@@ -700,7 +671,6 @@ const acceptAndEnter = async (token: string) => {
 
 // Handle login
 const handleLogin = async () => {
-  if (loginLocked.value) return
   try {
     const valid = await formRef.value?.validate()
     if (valid !== true) return
@@ -722,10 +692,6 @@ const handleLogin = async () => {
       await persistLoginResponse(response)
       notifyLoginSuccess(response, t, tm, formatRole, roleIcon)
     } else {
-      if (response.status === 429) {
-        startLoginRetryCountdown(response.retryAfter)
-        return
-      }
       MessagePlugin.error(response.message || t('auth.loginError'))
     }
   } catch (error: any) {
@@ -848,20 +814,16 @@ onMounted(async () => {
     return
   }
 
-  const AUTO_SETUP_FAILED_KEY = 'weknora_auto_setup_failed'
-  if (localStorage.getItem(AUTO_SETUP_FAILED_KEY) !== 'true') {
-    try {
-      const response = await autoSetup()
-      if (response.success) {
-        authStore.setLiteMode(true)
-        await persistLoginResponse(response)
-        return
-      } else {
-        localStorage.setItem(AUTO_SETUP_FAILED_KEY, 'true')
-      }
-    } catch {
-      localStorage.setItem(AUTO_SETUP_FAILED_KEY, 'true')
+  localStorage.removeItem('weknora_auto_setup_failed')
+  try {
+    const response = await autoSetup()
+    if (response.success) {
+      authStore.setLiteMode(true)
+      await persistLoginResponse(response)
+      return
     }
+  } catch {
+    // Auto-setup may be unavailable outside the native Lite shell.
   }
 
   loadOIDCConfig()
@@ -1131,7 +1093,7 @@ onMounted(async () => {
 }
 
 .showcase-description {
-  font-size: 15px;
+  font-size: var(--app-text-lg);
   color: rgba(255, 255, 255, 0.8);
   margin: 0 0 28px 0;
   font-family: var(--app-font-family);
@@ -1151,7 +1113,7 @@ onMounted(async () => {
   background: rgba(255, 255, 255, 0.2);
   border-radius: 20px;
   color: var(--td-text-color-anti);
-  font-size: 14px;
+  font-size: var(--app-text-base);
   font-weight: 500;
   font-family: var(--app-font-family);
 }
@@ -1183,7 +1145,7 @@ onMounted(async () => {
     height: 10px;
     background: rgba(255, 255, 255, 0.5);
     opacity: 1;
-    transition: all 0.3s ease;
+    transition: all var(--app-motion-slow) ease;
     margin: 0 6px !important;
   }
 
@@ -1264,7 +1226,7 @@ onMounted(async () => {
   border: 1px solid rgba(255, 255, 255, 0.25);
   color: var(--td-text-color-anti);
   text-decoration: none;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-weight: 600;
   font-family: var(--app-font-family);
   letter-spacing: 0.2px;
@@ -1295,7 +1257,7 @@ onMounted(async () => {
     color: var(--td-text-color-anti);
 
     .lang-flag-icon {
-      font-size: 16px;
+      font-size: var(--app-text-xl);
       line-height: 1;
       flex-shrink: 0;
     }
@@ -1319,7 +1281,7 @@ onMounted(async () => {
   min-width: 160px;
   background: rgba(255, 255, 255, 0.97);
   border: 1px solid var(--td-component-stroke);
-  border-radius: 8px;
+  border-radius: var(--app-radius-md);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
   overflow: hidden;
   z-index: 1000;
@@ -1331,12 +1293,12 @@ onMounted(async () => {
   gap: 10px;
   padding: 10px 14px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   font-family: var(--app-font-family);
   color: var(--td-text-color-primary);
 
   .lang-flag {
-    font-size: 16px;
+    font-size: var(--app-text-xl);
     flex-shrink: 0;
   }
 
@@ -1347,7 +1309,7 @@ onMounted(async () => {
   .check-icon {
     color: var(--td-success-color);
     font-weight: 700;
-    font-size: 14px;
+    font-size: var(--app-text-base);
     flex-shrink: 0;
   }
 
@@ -1382,15 +1344,15 @@ onMounted(async () => {
   gap: 10px;
   padding: 12px 14px;
   margin-bottom: 20px;
-  border-radius: 10px;
-  background: var(--td-bg-color-container-hover, rgba(0, 0, 0, 0.03));
+  border-radius: var(--app-radius-lg);
+  background: var(--td-bg-color-container-hover);
   border: 1px solid var(--td-component-stroke);
   color: var(--td-text-color-primary);
 }
 
 .invite-banner__icon {
   margin-top: 2px;
-  font-size: 18px;
+  font-size: var(--app-text-2xl);
   flex-shrink: 0;
   color: var(--td-text-color-secondary);
 }
@@ -1403,23 +1365,23 @@ onMounted(async () => {
 }
 
 .invite-banner__title {
-  font-size: 14px;
+  font-size: var(--app-text-base);
   font-weight: 600;
   line-height: 1.4;
   color: var(--td-text-color-primary);
 }
 
 .invite-banner__hint {
-  font-size: 12px;
+  font-size: var(--app-text-sm);
   color: var(--td-text-color-secondary);
   line-height: 1.5;
 }
 
 .invite-banner--error {
-  background: var(--td-error-color-1, rgba(220, 38, 38, 0.06));
-  border-color: var(--td-error-color-3, rgba(220, 38, 38, 0.2));
-  color: var(--td-error-color, #b91c1c);
-  font-size: 13px;
+  background: var(--td-error-color-1);
+  border-color: var(--td-error-color-3);
+  color: var(--td-error-color);
+  font-size: var(--app-text-md);
 }
 
 .form-header {
@@ -1428,7 +1390,7 @@ onMounted(async () => {
 }
 
 .form-title {
-  font-size: 24px;
+  font-size: var(--app-text-4xl);
   font-weight: 600;
   color: var(--td-text-color-primary);
   margin: 0 0 6px 0;
@@ -1436,7 +1398,7 @@ onMounted(async () => {
 }
 
 .form-welcome {
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-secondary);
   margin: 0;
   font-family: var(--app-font-family);
@@ -1445,8 +1407,8 @@ onMounted(async () => {
 .form-hint {
   margin: 10px 0 0;
   padding: 8px 12px;
-  border-radius: 8px;
-  background: var(--td-success-color-light, rgba(7, 192, 95, 0.08));
+  border-radius: var(--app-radius-md);
+  background: var(--td-success-color-light);
   color: var(--td-brand-color-active);
   font-size: 12.5px;
   line-height: 1.5;
@@ -1463,7 +1425,7 @@ onMounted(async () => {
     text-align: center;
     margin: 4px 0 14px;
     color: var(--td-text-color-secondary);
-    font-size: 13px;
+    font-size: var(--app-text-md);
     font-family: var(--app-font-family);
 
     span {
@@ -1485,8 +1447,8 @@ onMounted(async () => {
 
   &__button {
     height: 46px;
-    border-radius: 8px;
-    font-size: 15px;
+    border-radius: var(--app-radius-md);
+    font-size: var(--app-text-lg);
     font-weight: 500;
     border-color: var(--td-brand-color);
     color: var(--td-brand-color);
@@ -1494,13 +1456,13 @@ onMounted(async () => {
     &:hover {
       border-color: var(--td-brand-color-active);
       color: var(--td-brand-color-active);
-      background: var(--td-success-color-light, rgba(7, 192, 95, 0.08));
+      background: var(--td-success-color-light);
     }
   }
 }
 
 .form-subtitle {
-  font-size: 13px;
+  font-size: var(--app-text-md);
   color: var(--td-text-color-secondary);
   margin: 0;
   font-family: var(--app-font-family);
@@ -1508,7 +1470,7 @@ onMounted(async () => {
 
 .form-content {
   :deep(.t-form-item__label) {
-    font-size: 14px;
+    font-size: var(--app-text-base);
     color: var(--td-text-color-primary);
     font-weight: 500;
     margin-bottom: 8px;
@@ -1519,13 +1481,13 @@ onMounted(async () => {
 
   :deep(.t-input) {
     border: 1px solid var(--td-component-stroke);
-    border-radius: 8px;
+    border-radius: var(--app-radius-md);
     background: var(--td-bg-color-container);
-    transition: all 0.2s;
+    transition: all var(--app-motion-base);
 
     &:focus-within {
       border-color: var(--td-brand-color);
-      box-shadow: 0 0 0 3px rgba(7, 192, 95, 0.1);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--td-brand-color) 10%, transparent);
     }
 
     &:hover {
@@ -1537,7 +1499,7 @@ onMounted(async () => {
       box-shadow: none !important;
       outline: none !important;
       background: transparent;
-      font-size: 15px;
+      font-size: var(--app-text-lg);
       font-family: var(--app-font-family);
 
       &:focus {
@@ -1568,25 +1530,11 @@ onMounted(async () => {
 
 .submit-button {
   height: 46px;
-  border-radius: 8px;
-  font-size: 16px;
+  border-radius: var(--app-radius-md);
+  font-size: var(--app-text-xl);
   font-weight: 500;
   font-family: var(--app-font-family);
   margin: 20px 0 16px 0;
-}
-
-.login-rate-limit-notice {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  padding: 10px 12px;
-  color: var(--td-error-color-7);
-  background: var(--td-error-color-1);
-  border: 1px solid var(--td-error-color-3);
-  border-radius: 6px;
-  font-size: 13px;
-  line-height: 20px;
 }
 
 .oidc-divider {
@@ -1594,7 +1542,7 @@ onMounted(async () => {
   margin: 4px 0 6px;
   text-align: center;
   color: var(--td-text-color-placeholder);
-  font-size: 12px;
+  font-size: var(--app-text-sm);
 
   span {
     position: relative;
@@ -1615,14 +1563,14 @@ onMounted(async () => {
 
 .oidc-button {
   height: 46px;
-  border-radius: 8px;
-  font-size: 15px;
+  border-radius: var(--app-radius-md);
+  font-size: var(--app-text-lg);
   font-weight: 500;
 }
 
 .form-footer {
   text-align: center;
-  font-size: 14px;
+  font-size: var(--app-text-base);
   color: var(--td-text-color-secondary);
   font-family: var(--app-font-family);
   margin-top: 16px;
@@ -1634,7 +1582,7 @@ onMounted(async () => {
     text-decoration: none;
     margin-left: 4px;
     font-weight: 500;
-    transition: all 0.2s;
+    transition: all var(--app-motion-base);
 
     &:hover {
       color: var(--td-brand-color);
@@ -1657,7 +1605,7 @@ onMounted(async () => {
     display: flex;
     align-items: center;
     margin-bottom: 12px;
-    font-size: 13px;
+    font-size: var(--app-text-md);
     color: var(--td-text-color-secondary);
     font-family: var(--app-font-family);
 
@@ -1674,7 +1622,7 @@ onMounted(async () => {
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 12px;
+      font-size: var(--app-text-sm);
       font-weight: 700;
       margin-right: 10px;
       flex-shrink: 0;
@@ -1697,7 +1645,7 @@ onMounted(async () => {
   }
 
   .showcase-subtitle {
-    font-size: 18px;
+    font-size: var(--app-text-2xl);
   }
 
   .header-logo {
@@ -1758,7 +1706,7 @@ onMounted(async () => {
   }
 
   .showcase-subtitle {
-    font-size: 16px;
+    font-size: var(--app-text-xl);
     margin-bottom: 24px;
   }
 
@@ -1786,7 +1734,7 @@ onMounted(async () => {
 
     .header-link {
       padding: 8px 12px;
-      font-size: 12px;
+      font-size: var(--app-text-sm);
     }
   }
 
@@ -1818,11 +1766,11 @@ onMounted(async () => {
   }
 
   .showcase-subtitle {
-    font-size: 14px;
+    font-size: var(--app-text-base);
   }
 
   .tag {
-    font-size: 12px;
+    font-size: var(--app-text-sm);
     padding: 6px 16px;
   }
 
@@ -1838,7 +1786,7 @@ onMounted(async () => {
 
     .header-link {
       padding: 7px 10px;
-      font-size: 11px;
+      font-size: var(--app-text-xs);
     }
   }
 

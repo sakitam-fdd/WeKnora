@@ -12,8 +12,6 @@ export interface LoginRequest {
 export interface LoginResponse {
   success: boolean
   message?: string
-  status?: number
-  retryAfter?: string | number
   user?: {
     id: string
     username: string
@@ -104,6 +102,12 @@ export interface UserPreferences {
   last_active_tenant_id?: number | null
   // oidc_only_login 为 true 表示账号由 OIDC 自动开通且用户尚未设置已知密码。
   oidc_only_login?: boolean
+  // gallery 记录图库的个人状态：搜索激活模式与逐字段开/关（按属性 ID）。
+  // 每次变更整体覆盖该块；后端会校验 mode 与 status 取值。
+  gallery?: {
+    mode?: 'all' | 'custom'
+    status?: Record<string, string>
+  }
 }
 
 // 用户信息接口
@@ -217,9 +221,7 @@ export async function login(data: LoginRequest): Promise<LoginResponse> {
   } catch (error: any) {
     return {
       success: false,
-      message: error.message || t('error.auth.loginFailed'),
-      status: error.status,
-      retryAfter: error.retryAfter,
+      message: error.message || t('error.auth.loginFailed')
     }
   }
 }
@@ -297,16 +299,34 @@ export async function register(data: RegisterRequest): Promise<RegisterResponse>
 /**
  * Lite 版自动初始化（创建默认用户/空间 + 签发令牌）
  */
-export async function autoSetup(): Promise<LoginResponse> {
-  try {
-    const response = await post('/api/v1/auth/auto-setup', {})
-    return response as unknown as LoginResponse
-  } catch (error: any) {
-    return {
-      success: false,
-      message: error.message || 'Auto-setup unavailable'
+let autoSetupPromise: Promise<LoginResponse> | null = null
+
+export function autoSetup(): Promise<LoginResponse> {
+  if (autoSetupPromise) return autoSetupPromise
+
+  const request = (async () => {
+    try {
+      const nativeApp = (window as any).go?.main?.App
+      if (!nativeApp?.GetAutoSetupToken) return { success: false, message: 'Desktop authentication required' }
+      const token = await nativeApp.GetAutoSetupToken()
+      const response = await post('/api/v1/auth/auto-setup', {}, {
+        headers: { 'X-WeKnora-Desktop-Token': token },
+      })
+      return response as unknown as LoginResponse
+    } catch (error: any) {
+      return {
+        success: false,
+        message: error.message || 'Auto-setup unavailable'
+      }
     }
-  }
+  })()
+
+  autoSetupPromise = request
+  void request.then(
+    () => { if (autoSetupPromise === request) autoSetupPromise = null },
+    () => { if (autoSetupPromise === request) autoSetupPromise = null },
+  )
+  return request
 }
 
 /**

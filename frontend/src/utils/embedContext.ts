@@ -1,20 +1,12 @@
-export interface EmbedChatPayload {
-  query: string
-  prompt_context?: string
-}
-
-/** Build an embed chat payload without mixing host context into the retrieval query. */
-export function buildEmbedChatPayload(
+/** Prefix host-injected context onto the user query for embed chat. */
+export function buildQueryWithHostContext(
   query: string,
   hostContext?: Record<string, unknown>,
-): EmbedChatPayload {
-  if (!hostContext || !Object.keys(hostContext).length) return { query }
-  const entries = Object.entries(hostContext)
+): string {
+  if (!hostContext || !Object.keys(hostContext).length) return query
+  const lines = Object.entries(hostContext)
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
-  if (!entries.length) return { query }
-
-  return {
-    query,
-    prompt_context: `[Host context]\n${JSON.stringify(Object.fromEntries(entries), null, 2)}`,
-  }
+    .map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
+  if (!lines.length) return query
+  return `[Host context]\n${lines.join('\n')}\n\n${query}`
 }

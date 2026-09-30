@@ -2,12 +2,9 @@ package router
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
 
-	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/middleware"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -206,7 +203,7 @@ func RegisterMyEnvVarRoutes(r *gin.RouterGroup, h *handler.MeEnvVarHandler) {
 }
 
 // RegisterAuthRoutes registers authentication routes
-func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rbacGuards, redisClient *redis.Client, cfg *config.Config) {
+func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rbacGuards) {
 	r.POST("/auth/register", handler.Register)
 	// Share-link surfaces are unauthenticated and accept a plaintext
 	// token from the caller; rate-limit by IP to bound brute-force /
@@ -216,16 +213,7 @@ func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rba
 	publicAuthRL := middleware.PublicAuthRateLimit()
 	r.POST("/auth/register-by-invite", publicAuthRL, handler.RegisterByInvite)
 	r.POST("/auth/invitations/lookup", publicAuthRL, handler.LookupInvitationByToken)
-	loginMax, loginWindow := 10, 10*time.Minute
-	if cfg != nil && cfg.Auth != nil {
-		if cfg.Auth.LoginRateLimitMax > 0 {
-			loginMax = cfg.Auth.LoginRateLimitMax
-		}
-		if cfg.Auth.LoginRateLimitWindowMinutes > 0 {
-			loginWindow = time.Duration(cfg.Auth.LoginRateLimitWindowMinutes) * time.Minute
-		}
-	}
-	r.POST("/auth/login", middleware.LoginRateLimit(redisClient, loginMax, loginWindow), handler.Login)
+	r.POST("/auth/login", handler.Login)
 	r.POST("/auth/auto-setup", handler.AutoSetup)
 	r.GET("/auth/config", handler.GetAuthConfig)
 	r.POST("/auth/switch-tenant", handler.SwitchTenant)
@@ -257,6 +245,10 @@ func RegisterSystemRoutes(
 	handler *handler.SystemHandler,
 	g *rbacGuards,
 ) {
+	// JWT-only: this pops a native dialog on the Lite machine. API keys must
+	// not trigger it. Undeclared for the API-key gate, so keys are denied.
+	r.POST("/system/host-project-dir", g.Viewer(), handler.PickHostProjectDir)
+
 	systemRoutes := g.apiKeyGroup(r.Group("/system"), apiKeyManageVectorStores(apiKeyFullAccess()))
 	{
 		systemRoutes.With(apiKeyAny()).GET("/capabilities", g.Viewer(), handler.GetDeploymentCapabilities)
@@ -296,6 +288,12 @@ func RegisterSystemAdminRoutes(
 	// the guard, so adding new endpoints can't accidentally drop the gate.
 	adminRoutes := r.Group("/system/admin", g.SystemAdmin())
 	{
+		// Catalog mutation is reserved to authenticated system-admin users.
+		// API keys remain default-denied by the API-key gate.
+		adminRoutes.GET("/model-catalog", handler.GetModelCatalog)
+		adminRoutes.POST("/model-catalog/preview", handler.PreviewModelCatalog)
+		adminRoutes.PUT("/model-catalog", handler.PublishModelCatalog)
+
 		// P0: SystemAdmin role management
 		adminRoutes.POST("/promote", handler.PromoteUserToSystemAdmin)
 		adminRoutes.POST("/revoke", handler.RevokeSystemAdmin)

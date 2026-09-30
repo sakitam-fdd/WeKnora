@@ -17,6 +17,7 @@ self-sufficient using pypdfium2 + the Go-side OCR that already exists.
 """
 
 import base64
+from collections import Counter
 import io
 import logging
 import os
@@ -28,6 +29,7 @@ from docreader.config import CONFIG
 from docreader.models.document import Document
 from docreader.parser.base_parser import BaseParser
 from docreader.parser.concurrency import parser_worker_limit
+from docreader.parser.source_locator import PageGeometry, page_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,12 @@ MAX_FIGURE_HEIGHT_RATIO = _env_float("DOCREADER_PDF_MAX_FIGURE_HEIGHT_RATIO", 0.
 # Can be overridden per-upload via parser_engine_overrides.pdf_force_scanned.
 FORCE_SCANNED_PDF = _env_bool("DOCREADER_PDF_FORCE_SCANNED", False)
 
+# --- Source locators ---------------------------------------------------------
+# Record where each paragraph of a native text page sits on the page, so a
+# citation can open the PDF there and outline the paragraph. Costs one glyph
+# pass per text page; disable to only record page numbers.
+SOURCE_BOXES = _env_bool("DOCREADER_PDF_SOURCE_BOXES", True)
+
 # pdfium / Adobe text layers often emit U+FFFE for missing hyphenation or ligatures.
 _PDF_ARTIFACT_RE = re.compile(r"[\u00ad\u200b-\u200f\ufeff\ufffe\uffff]")
 _PDF_ARTIFACT_JOIN_RE = re.compile(r"(\w)[\u00ad\ufffe](\w)")
@@ -175,30 +183,6 @@ def _classify_page(image_area_ratio: float, text_len: int) -> str:
     if text_len < SCAN_MIN_CHARS_PER_PAGE and image_area_ratio >= _LOW_TEXT_IMAGE_RATIO:
         return "scanned"
     return "text"
-
-
-def _classify_page_with_text_layer_fallback(
-    image_area_ratio: float,
-    plain_text: str,
-    prefer_text_layer: bool = False,
-) -> str:
-    """Classify a page, optionally retaining a demonstrably usable text layer.
-
-    The normal scanned-page route intentionally favours the full-page image:
-    scan PDFs often ship an inaccurate hidden OCR layer. When the caller has
-    no OCR/VLM available, however, discarding a well-formed native text layer
-    would leave the document with no searchable content at all. This fallback
-    is opt-in and deliberately uses the stricter text-quality check below
-    instead of a character-count threshold.
-    """
-    classification = _classify_page(image_area_ratio, len((plain_text or "").strip()))
-    if (
-        classification == "scanned"
-        and prefer_text_layer
-        and _plain_is_well_formed(plain_text)
-    ):
-        return "text"
-    return classification
 
 
 def _page_image_area_ratio(page, raw) -> float:
@@ -653,23 +637,31 @@ def _point_in_boxes(x: float, y: float, boxes: list) -> bool:
     return False
 
 
-def _page_chars(textpage, page, raw) -> tuple:
+def _page_chars(textpage, page, raw, loose: bool = False) -> tuple:
     """Return ``(chars, page_width)`` with hidden/off-page glyphs filtered.
 
     Working at the glyph level (instead of pdfium rect segments) keeps mixed
     CJK + Latin/number lines in their true left-to-right order, which the
-    rect-level ``get_text_bounded`` API scrambles.
+    rect-level ``get_text_bounded`` API scrambles. ``loose`` boxes span the
+    font's ascent to descent, so every glyph of a line shares one height.
     """
     n = textpage.count_chars()
     if n <= 0:
         return [], 0.0
-    width, height = page.get_size()
+    # Glyph coordinates are unrotated PDF user space. get_size() reports
+    # rotated dimensions and would discard valid text on cropped/rotated pages.
+    try:
+        crop_left, crop_bottom, crop_right, crop_top = page.get_cropbox()
+    except Exception:
+        width, height = page.get_size()
+        crop_left, crop_bottom, crop_right, crop_top = 0, 0, width, height
+    width = crop_right - crop_left
     invisible = _collect_invisible_boxes(page, raw) if FILTER_HIDDEN_TEXT else []
 
     chars: list = []
     for i in range(n):
         try:
-            left, bottom, right, top = textpage.get_charbox(i)
+            left, bottom, right, top = textpage.get_charbox(i, loose=loose)
         except Exception:
             continue
         ch = textpage.get_text_range(i, 1)
@@ -678,11 +670,11 @@ def _page_chars(textpage, page, raw) -> tuple:
         x0, x1 = (left, right) if left <= right else (right, left)
         y0, y1 = (bottom, top) if bottom <= top else (top, bottom)
         if FILTER_HIDDEN_TEXT:
-            if x1 < 0 or x0 > width or y1 < 0 or y0 > height:
+            if x1 < crop_left or x0 > crop_right or y1 < crop_bottom or y0 > crop_top:
                 continue  # off-page glyph
             if invisible and _point_in_boxes((x0 + x1) / 2, (y0 + y1) / 2, invisible):
                 continue  # covered by an invisible text object
-        chars.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "ch": ch})
+        chars.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "ch": ch, "i": i})
     return chars, width
 
 
@@ -948,12 +940,6 @@ def _plain_is_well_formed(plain: str) -> bool:
         return True
     if plain.count(" . . ") >= 2:
         return True
-    # Chinese/Japanese/Korean text usually has no whitespace-delimited words,
-    # so the Latin token heuristic below would reject a healthy text layer.
-    non_space = [ch for ch in plain if not ch.isspace()]
-    cjk_count = sum("\u3400" <= ch <= "\u9fff" for ch in non_space)
-    if len(non_space) >= 80 and cjk_count / len(non_space) >= 0.7:
-        return True
     words = re.findall(r"\S+", plain)
     if len(words) < 30:
         return False
@@ -969,6 +955,11 @@ def _should_prefer_plain(plain: str, layout: str) -> bool:
         return True
     if not plain:
         return False
+    # Geometry must never change numeric evidence (1.5 -> 1 5, -5 -> 5).
+    # Compare a multiset so legitimate column reordering is still allowed.
+    numbers = re.compile(r"[+−-]?\d+(?:[.,:/]\d+)*(?:[%‰])?")
+    if Counter(numbers.findall(plain)) != Counter(numbers.findall(layout)):
+        return True
     n, single, punct_only = _layout_line_stats(layout)
     if n == 0:
         return True
@@ -1016,6 +1007,81 @@ def _extract_layout_text(page, raw) -> str:
         return _extract_page_text(page)
     finally:
         _close_pdfium_resource(textpage)
+
+
+# A visual line is cut where a gap wider than one glyph height coincides with
+# a jump in the text stream: the gutter between two columns, not a word space.
+LINE_SEGMENT_GAP_RATIO = 1.0
+LINE_SEGMENT_STREAM_JUMP = 8
+LINE_SEGMENT_MIN_CHARS = 3
+
+
+def _split_line_at_gaps(line: dict) -> list:
+    """Cut a visual line where it crosses from one column into another.
+
+    Narrow two-column gutters (ACL/IEEE papers leave ~16pt) and anything that
+    spans them (a title, a wide table) defeat the full-height gutter search,
+    so glyphs of both columns land in one line; each side must be placed and
+    boxed on its own. Columns are far apart in the text stream while glyphs of
+    one line are consecutive, which keeps wide justified word spaces intact.
+    """
+    whole = [{"text": line["text"], "bbox": line["bbox"]}]
+    chars = [c for c in line["chars"] if not c["ch"].isspace()]
+    if len(chars) < 2 * LINE_SEGMENT_MIN_CHARS:
+        return whole
+    min_gap = max(max(c["y1"] - c["y0"] for c in chars), 1.0) * LINE_SEGMENT_GAP_RATIO
+    segments: list = [[chars[0]]]
+    for prev, cur in zip(chars, chars[1:]):
+        jump = abs(cur.get("i", 0) - prev.get("i", 0))
+        if cur["x0"] - prev["x1"] > min_gap and jump > LINE_SEGMENT_STREAM_JUMP:
+            segments.append([cur])
+        else:
+            segments[-1].append(cur)
+    if len(segments) == 1 or any(len(seg) < LINE_SEGMENT_MIN_CHARS for seg in segments):
+        return whole
+    out = []
+    for seg in segments:
+        text = _join_line_glyphs(seg)
+        if text.strip():
+            out.append({"text": text, "bbox": _chars_bbox(seg)})
+    return out or whole
+
+
+def _page_line_boxes(page, raw) -> list:
+    """Visual lines of a text page as ``{"text", "bbox"}`` in PDF points.
+
+    Lines are grouped per column so a two-column page does not fuse the
+    columns' glyphs into one line. Any failure yields no lines, which only
+    downgrades the page's locators to page numbers.
+    """
+    textpage = None
+    try:
+        textpage = page.get_textpage()
+        # Tight glyph boxes put "a" and "d" at different heights, which splits
+        # one line of text into fragments by letter shape.
+        chars, width = _page_chars(textpage, page, raw, loose=True)
+        if not chars:
+            return []
+        heights = [c["y1"] - c["y0"] for c in chars if c["y1"] - c["y0"] > 0]
+        scale = (statistics.median(heights) if heights else 1.0) or 1.0
+        lines = []
+        for col in _split_columns(chars, scale, width):
+            for ln in _group_lines_with_chars(col):
+                lines.extend(_split_line_at_gaps(ln))
+        return lines
+    except Exception:
+        logger.debug("line box extraction failed", exc_info=True)
+        return []
+    finally:
+        _close_pdfium_resource(textpage)
+
+
+def _page_geometry(page):
+    try:
+        return PageGeometry(page.get_cropbox(), page.get_rotation())
+    except Exception:
+        logger.debug("page geometry unavailable", exc_info=True)
+        return None
 
 
 def _effective_scale(page, scale: float, max_edge: int) -> float:
@@ -1423,10 +1489,23 @@ class PDFScannedParser(BaseParser):
                 finally:
                     _close_pdfium_resource(pdf)
 
+            source_blocks = []
+            offset = 0
             for i in range(page_count):
                 page_filename = f"{base_name}_page_{i+1}.jpg"
                 ref_path = f"images/{page_filename}"
-                markdown_lines.append(f"![{page_filename}]({ref_path})")
+                line = f"![{page_filename}]({ref_path})"
+                if markdown_lines:
+                    offset += 2
+                markdown_lines.append(line)
+                source_blocks.append(
+                    {
+                        "start": offset,
+                        "end": offset + len(line),
+                        "locator": {"type": "pdf", "page": i + 1, "mapping": "exact"},
+                    }
+                )
+                offset += len(line)
                 images[ref_path] = base64.b64encode(rendered[i]).decode("utf-8")
 
             text = "\n\n".join(markdown_lines)
@@ -1437,6 +1516,7 @@ class PDFScannedParser(BaseParser):
                     "image_source_type": "scanned_pdf",
                     "page_count": page_count,
                 },
+                source_blocks=source_blocks,
             )
         except Exception as e:
             logger.exception("PDFScannedParser failed to parse PDF: %s", e)
@@ -1457,17 +1537,11 @@ class PDFParser(BaseParser):
     Force-scanned mode (``pdf_force_scanned=true`` override or
     ``DOCREADER_PDF_FORCE_SCANNED=true`` env) skips classification and
     renders every page as an image.
-
-    ``pdf_prefer_text_layer=true`` is a request-scoped fallback used when OCR
-    is unavailable. It only keeps scanned-classified pages whose text layer
-    passes ``_plain_is_well_formed``; the default remains the safer image/OCR
-    path for potentially garbled scan OCR layers.
     """
 
     def __init__(self, file_name: str = "", file_type=None, **kwargs):
         # Capture per-upload override before BaseParser consumes kwargs.
         raw = kwargs.pop("pdf_force_scanned", None)
-        prefer_text_layer = kwargs.pop("pdf_prefer_text_layer", None)
         super().__init__(file_name=file_name, file_type=file_type, **kwargs)
         # Priority: per-upload override > global env > default (False).
         if raw is not None:
@@ -1476,9 +1550,6 @@ class PDFParser(BaseParser):
             }
         else:
             self._force_scanned = FORCE_SCANNED_PDF
-        self._prefer_text_layer = str(prefer_text_layer).strip().lower() in {
-            "1", "true", "yes", "y", "on",
-        }
 
     def parse_into_text(self, content: bytes) -> Document:
         # Force-scanned short-circuit: render every page as an image.
@@ -1537,21 +1608,16 @@ class PDFParser(BaseParser):
             # Pass 1: cheap text extraction + image-area classification.
             texts: list = []
             classes: list = []
-            text_layer_fallback_indices: list = []
             vector_clips: dict = {}
+            line_boxes: dict = {}
+            geometries: dict = {}
             for i in range(page_count):
                 page = pdf[i]
                 try:
+                    geometries[i] = _page_geometry(page)
                     plain = _extract_page_text(page)
                     ratio = _page_image_area_ratio(page, pdfium_r)
-                    original_cls = _classify_page(ratio, len(plain.strip()))
-                    cls = _classify_page_with_text_layer_fallback(
-                        ratio,
-                        plain,
-                        self._prefer_text_layer,
-                    )
-                    if cls == "text" and original_cls == "scanned":
-                        text_layer_fallback_indices.append(i)
+                    cls = _classify_page(ratio, len(plain.strip()))
                     # Layout reconstruction only pays off (and is only spent) on
                     # native text pages; scanned pages are rendered, not read.
                     if cls == "text" and LAYOUT_ORDERING:
@@ -1581,6 +1647,8 @@ class PDFParser(BaseParser):
                             for ref_path, b64, _y, _cap in clips:
                                 images[ref_path] = b64
                     text = _postprocess_pdf_text(text)
+                    if cls == "text" and SOURCE_BOXES:
+                        line_boxes[i] = _page_line_boxes(page, pdfium_r)
                     if cls == "text" and vector_clips.get(i):
                         text = _inject_figure_markdown_before_captions(
                             text, vector_clips[i]
@@ -1621,27 +1689,60 @@ class PDFParser(BaseParser):
         finally:
             _close_pdfium_resource(pdf)
 
-        # Assemble markdown in reading order.
+        # Assemble markdown in reading order, recording where each page's
+        # text lands so citations can point back at the page (and paragraph).
         embedded_count = 0
         vector_figure_count = 0
         blocks = []
+        source_blocks = []
+        offset = 0
+
+        def place(part: str) -> int:
+            nonlocal offset
+            if blocks:
+                offset += 2  # the "\n\n" separator
+            start = offset
+            blocks.append(part)
+            offset += len(part)
+            return start
+
         for i in range(page_count):
+            page_only = {"type": "pdf", "page": i + 1, "mapping": "exact"}
             if classes[i] == "scanned":
                 page_filename = f"{base_name}_page_{i+1}.jpg"
-                blocks.append(f"![{page_filename}](images/{page_filename})")
+                part = f"![{page_filename}](images/{page_filename})"
+                start = place(part)
+                source_blocks.append(
+                    {"start": start, "end": start + len(part), "locator": page_only}
+                )
             else:
                 stripped = texts[i].strip()
                 if stripped:
-                    blocks.append(stripped)
+                    start = place(stripped)
+                    source_blocks.extend(
+                        page_blocks(
+                            stripped,
+                            start,
+                            i + 1,
+                            line_boxes.get(i) or [],
+                            geometries.get(i),
+                        )
+                    )
                 vector_figure_count += len(vector_clips.get(i, []))
                 page_images = list(embedded.get(i, []))
                 page_images.sort(key=lambda item: item[2], reverse=True)
                 for ref_path, _b64, _y in page_images:
                     fname = os.path.basename(ref_path)
-                    blocks.append(f"![{fname}]({ref_path})")
+                    part = f"![{fname}]({ref_path})"
+                    start = place(part)
+                    source_blocks.append(
+                        {"start": start, "end": start + len(part), "locator": dict(page_only)}
+                    )
                     embedded_count += 1
 
-        content_text = "\n\n".join(blocks).strip()
+        # Every part is already stripped, so the join needs no trimming and
+        # the recorded offsets stay exact.
+        content_text = "\n\n".join(blocks)
 
         metadata = {
             "page_count": page_count,
@@ -1649,19 +1750,22 @@ class PDFParser(BaseParser):
             "text_page_count": page_count - len(scanned_indices),
             "embedded_image_count": embedded_count,
             "vector_figure_count": vector_figure_count,
-            "text_layer_fallback_page_count": len(text_layer_fallback_indices),
             "image_source_type": "scanned_pdf" if scanned_indices else "pdf_text_layer",
         }
 
         logger.info(
             "PDFParser: %s -> %d pages (%d scanned, %d text), "
-            "embedded_images=%d, text_layer_fallback=%d, content_len=%d",
+            "embedded_images=%d, content_len=%d",
             self.file_name,
             page_count,
             len(scanned_indices),
             page_count - len(scanned_indices),
             embedded_count,
-            len(text_layer_fallback_indices),
             len(content_text),
         )
-        return Document(content=content_text, images=images, metadata=metadata)
+        return Document(
+            content=content_text,
+            images=images,
+            metadata=metadata,
+            source_blocks=source_blocks,
+        )

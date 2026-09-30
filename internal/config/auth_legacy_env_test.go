@@ -7,8 +7,8 @@ import "testing"
 // DISABLE_REGISTRATION=true would block /auth/register at the handler layer
 // but leave /auth/config reporting self_serve, so the frontend would keep
 // showing the (broken) Register entry. Coercing registration_mode here keeps
-// both gates in sync, and matches the docs/RBAC说明.md "env always wins over
-// YAML" rule.
+// both gates in sync and preserves the environment-over-YAML precedence
+// documented in website-docs/03-features/01-tenant-auth.md.
 func TestApplyAuthAndTenantDefaults_DisableRegistrationDrivesRegistrationMode(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -101,25 +101,6 @@ func TestApplyAuthAndTenantDefaults_DefaultTenantMode(t *testing.T) {
 			t.Fatal("ValidateConfig unexpectedly accepted an invalid default tenant mode")
 		}
 	})
-}
-
-func TestApplyAuthAndTenantDefaults_LoginRateLimit(t *testing.T) {
-	cfg := &Config{Auth: &AuthConfig{}}
-
-	applyAuthAndTenantDefaults(cfg)
-
-	if cfg.Auth.LoginRateLimitMax != 10 {
-		t.Fatalf("login_rate_limit_max = %d, want 10", cfg.Auth.LoginRateLimitMax)
-	}
-	if cfg.Auth.LoginRateLimitWindowMinutes != 10 {
-		t.Fatalf("login_rate_limit_window_minutes = %d, want 10", cfg.Auth.LoginRateLimitWindowMinutes)
-	}
-	if err := ValidateConfig(&Config{Auth: &AuthConfig{LoginRateLimitMax: -1}}); err == nil {
-		t.Fatal("ValidateConfig unexpectedly accepted a negative login_rate_limit_max")
-	}
-	if err := ValidateConfig(&Config{Auth: &AuthConfig{LoginRateLimitWindowMinutes: -1}}); err == nil {
-		t.Fatal("ValidateConfig unexpectedly accepted a negative login_rate_limit_window_minutes")
-	}
 }
 
 // TestApplyAuthAndTenantDefaults_CrossTenantAccess is a regression test for the

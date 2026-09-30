@@ -12,6 +12,10 @@ type CreateSessionRequest struct {
 	Title string `json:"title"`
 	// Description for the session (optional)
 	Description string `json:"description"`
+	// ProjectDir is an optional Lite host-sandbox binding. When set it must
+	// be an absolute path already present in the user-approved ProjectDirs
+	// list. Empty means the session gets an auto-allocated workspace.
+	ProjectDir string `json:"project_dir,omitempty"`
 }
 
 // GenerateTitleRequest defines the request structure for generating a session title
@@ -51,7 +55,6 @@ type CreateKnowledgeQARequest struct {
 	LocalBrowserEnabled   bool                         `json:"local_browser_enabled"`                 // Browser source
 	WebSearchEnabled      bool                         `json:"web_search_enabled"`                    // Whether web search is enabled for this request
 	SummaryModelID        string                       `json:"summary_model_id"`                      // Optional summary model ID for this request (overrides session default)
-	RerankModelID         string                       `json:"rerank_model_id,omitempty"`             // per-request rerank
 	MCPServiceIDs         []string                     `json:"mcp_service_ids"`                       // Per-request MCP services selected via @mention
 	SkillNames            []string                     `json:"skill_names"`                           // Per-request Skills selected via @mention
 	TagIDs                []string                     `json:"tag_ids"`                               // @mentioned tag IDs (display/debug; scoped via MentionedItems)
@@ -62,8 +65,11 @@ type CreateKnowledgeQARequest struct {
 	AttachmentIDs         []string                     `json:"attachment_ids,omitempty"`              // Pre-uploaded session-scoped document IDs
 	Channel               string                       `json:"channel"`                               // Source channel: "web", "api", "im", etc.
 	SuggestionAttribution *types.SuggestionAttribution `json:"suggestion_attribution,omitempty"`
-	// PromptContext is optional LLM-only context excluded from direct query rewrite and retrieval inputs.
-	PromptContext string `json:"prompt_context,omitempty"`
+	// QuestionOrigin is the knowledge source of a picked suggested question.
+	QuestionOrigin *types.QuestionOrigin `json:"question_origin,omitempty"`
+
+	// ReasoningEffort overrides thinking for this request; empty inherits the agent configuration.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // AttachmentUpload represents a file attachment upload from the client
@@ -81,7 +87,14 @@ type SearchKnowledgeRequest struct {
 	KnowledgeIDs     []string               `json:"knowledge_ids"`                         // IDs of specific knowledge (files) to search
 	TagIDs           []string               `json:"tag_ids"`                               // Tag IDs for filtering within a single KB
 	MentionedItems   []MentionedItemRequest `json:"mentioned_items"`                       // Optional scoped tag mentions
-	RerankModelID    string                 `json:"rerank_model_id,omitempty"`             // per-request rerank
+
+	// Optional overrides of the tenant retrieval config. Omitted fields keep it.
+	VectorThreshold      *float64             `json:"vector_threshold,omitempty"`       // Minimum vector similarity
+	KeywordThreshold     *float64             `json:"keyword_threshold,omitempty"`      // Minimum keyword score
+	MatchCount           int                  `json:"match_count,omitempty"`            // Number of results to return
+	DisableKeywordsMatch bool                 `json:"disable_keywords_match,omitempty"` // Vector recall only
+	DisableVectorMatch   bool                 `json:"disable_vector_match,omitempty"`   // Keyword recall only
+	Rerank               *types.RerankOptions `json:"rerank,omitempty"`                 // Rerank override
 }
 
 // StopSessionRequest represents the stop session request

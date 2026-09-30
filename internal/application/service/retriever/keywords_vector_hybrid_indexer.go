@@ -2,7 +2,6 @@ package retriever
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -25,16 +24,11 @@ import (
 // kicks in for genuinely pathological inputs.
 const safetyMaxChars = 20000
 
-// embedRetryAttempts and embedRetryBaseDelay control the outer exponential
-// backoff applied to BatchEmbedWithPool calls. Sub-batch failures (including
-// 429) are already retried inside BatchEmbedWithPool; this outer loop is a
-// last-resort safety net for whole-call failures and deliberately uses a
-// longer base delay so rate-limited providers are not immediately re-slammed.
+// embedRetryAttempts and embedRetryBaseDelay control the exponential backoff
+// applied to BatchEmbedWithPool calls.
 const (
-	embedRetryAttempts     = 5
-	embedRetryBaseDelay    = 500 * time.Millisecond
-	embedRetryMaxDelay     = 16 * time.Second
-	embedRetryRateLimitMin = 2 * time.Second
+	embedRetryAttempts  = 5
+	embedRetryBaseDelay = 200 * time.Millisecond
 )
 
 var embeddingImagePayloadPatterns = []*regexp.Regexp{
@@ -133,11 +127,8 @@ func (v *KeywordsVectorHybridRetrieveEngineService) BatchIndex(ctx context.Conte
 }
 
 // batchEmbedWithBackoff calls BatchEmbedWithPool with exponential backoff on
-// transient failures. BatchEmbedWithPool itself already preserves successful
-// sub-batches and retries only the failed ones; this outer loop covers the
-// rare case where the whole call still fails (e.g. every sub-batch 429'd).
-// Rate-limit errors force a longer floor delay so we do not re-amplify RPM
-// pressure within a few hundred milliseconds.
+// transient failures (200 / 400 / 800 / 1600 / 3200 ms). It returns the last
+// embedding result on success or the last error if every attempt failed.
 func batchEmbedWithBackoff(ctx context.Context, embedder embedding.Embedder, contentList []string) ([][]float32, error) {
 	delay := embedRetryBaseDelay
 	var (
@@ -150,30 +141,13 @@ func batchEmbedWithBackoff(ctx context.Context, embedder embedding.Embedder, con
 			return embeddings, nil
 		}
 		logger.Errorf(ctx, "BatchEmbedWithPool attempt %d/%d failed: %v", attempt+1, embedRetryAttempts, err)
-		if attempt+1 >= embedRetryAttempts {
-			break
-		}
-		wait := delay
-		if embedding.IsRateLimitError(err) {
-			if wait < embedRetryRateLimitMin {
-				wait = embedRetryRateLimitMin
+		if attempt+1 < embedRetryAttempts {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			}
-			var rl *embedding.RateLimitError
-			if errors.As(err, &rl) && rl.RetryAfter > wait {
-				wait = rl.RetryAfter
-			}
-		}
-		if wait > embedRetryMaxDelay {
-			wait = embedRetryMaxDelay
-		}
-		select {
-		case <-time.After(wait):
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		delay *= 2
-		if delay > embedRetryMaxDelay {
-			delay = embedRetryMaxDelay
+			delay *= 2
 		}
 	}
 	return embeddings, err

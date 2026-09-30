@@ -16,7 +16,7 @@ import {
   stopEmbedSession,
 } from '@/api/embed'
 import { embedToast } from '@/utils/embedToast'
-import { buildEmbedChatPayload } from '@/utils/embedContext'
+import { buildQueryWithHostContext } from '@/utils/embedContext'
 import { fileToDataURI } from '@/utils/embedFile'
 import { useI18n } from 'vue-i18n'
 import { useChatStreamHandler } from '@/composables/useChatStreamHandler'
@@ -249,7 +249,7 @@ export function useEmbedChatSession(options: {
   ) => {
     stopStream()
     prepareForNewOutgoingMessage()
-    const outboundPayload = buildEmbedChatPayload(value, options.hostContext?.value)
+    const outboundQuery = buildQueryWithHostContext(value, options.hostContext?.value)
     const visitorWebSearchEnabled = opts.webSearchEnabled ?? false
     const imageFiles = (options.allowFileUpload ? opts.imageFiles : undefined) || []
     const attachmentFiles = (options.allowFileUpload ? opts.attachmentFiles : undefined) || []
@@ -280,7 +280,7 @@ export function useEmbedChatSession(options: {
     }
 
     messagesList.push({
-      content: outboundPayload.query,
+      content: value,
       role: 'user',
       mentioned_items: [],
       images: displayImages,
@@ -288,13 +288,13 @@ export function useEmbedChatSession(options: {
       channel: 'embed',
       created_at: new Date().toISOString(),
     })
-    postEmbedMessageSent(options.channelId, options.sessionId.value, outboundPayload.query)
+    postEmbedMessageSent(options.channelId, options.sessionId.value, value)
     relayEmbedWebhookEvent(
       options.channelId,
       options.token,
       options.sessionId.value,
       options.sessionSig.value,
-      { type: 'message_sent', query: outboundPayload.query },
+      { type: 'message_sent', query: value },
     )
     userHasScrolledUp.value = false
     scrollToBottom(true)
@@ -318,8 +318,7 @@ export function useEmbedChatSession(options: {
       mentioned_items: [],
       images: imageAttachments.length > 0 ? imageAttachments : undefined,
       attachment_uploads: attachmentUploads.length > 0 ? attachmentUploads : undefined,
-      query: outboundPayload.query,
-      prompt_context: outboundPayload.prompt_context,
+      query: outboundQuery,
       suggestion_attribution: suggestionAttribution || undefined,
       method: 'POST',
       url: endpoint,

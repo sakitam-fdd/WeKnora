@@ -74,10 +74,9 @@ type SplitterConfig struct {
 }
 
 // Default chunk sizing constants. Single source of truth for the entire
-// chunker package and (via knowledge.go::buildSplitterConfig) the
-// knowledge service. The frontend KnowledgeBaseEditorModal mirrors these
-// numbers in its initial form state — keep them in sync if you change
-// either value here.
+// chunker package and the knowledge service via NormalizeSplitterConfig.
+// The frontend KnowledgeBaseEditorModal mirrors these numbers in its initial
+// form state — keep them in sync if you change either value here.
 //
 // DefaultChunkSize = 512 chars: ~100–130 English tokens / ~300 Chinese
 // tokens. Validated as a strong baseline by the Vecta Feb-2026 benchmark
@@ -115,10 +114,18 @@ func DefaultConfig() SplitterConfig {
 }
 
 // protectedPatterns are regex patterns for content that must not be split.
+//
+// The Markdown link/image patterns deliberately exclude '\n' and bound the
+// link text / destination length: CommonMark forbids them from spanning a
+// blank line, and the previous unbounded [^\]]* / [^)]+ let a stray '[' left
+// behind by OCR swallow whole paragraphs as one "protected" atomic span,
+// defeating chunking entirely.
 var protectedPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?s)\$\$.*?\$\$`),                                                               // LaTeX block math
-	regexp.MustCompile(`!\[[^\]]*\]\([^)]+\)`),                                                          // Markdown images
-	regexp.MustCompile(`\[[^\]]*\]\([^)]+\)`),                                                           // Markdown links
+	regexp.MustCompile(`(?s)\$\$.*?\$\$`), // LaTeX block math
+	// Markdown images / links: single line, bounded so a stray OCR '['
+	// cannot swallow a paragraph (CommonMark forbids blank-line spans).
+	regexp.MustCompile(`!\[[^\]\n]{0,200}\]\([^)\n]{1,500}\)`),
+	regexp.MustCompile(`\[[^\]\n]{1,200}\]\([^)\n]{1,500}\)`),
 	regexp.MustCompile("(?m)[ ]*(?:\\|[^|\\n]*)+\\|[\\r\\n]+\\s*(?:\\|\\s*:?-{3,}:?\\s*)+\\|[\\r\\n]+"), // Table header+separator
 	regexp.MustCompile("(?m)[ ]*(?:\\|[^|\\n]*)+\\|[\\r\\n]+"),                                          // Table rows
 	regexp.MustCompile("(?s)```(?:\\w+)?[\\r\\n].*?```"),                                                // Fenced code blocks
@@ -398,10 +405,7 @@ func mergeUnits(units []splitUnit, chunkSize, chunkOverlap int) []Chunk {
 		return nil
 	}
 
-	// Keep oversized protected Markdown blocks under a conservative emergency
-	// ceiling to reduce the chance of exceeding common embedding input limits.
-	// Ordinary chunks still follow the knowledge base's smaller ChunkSize.
-	const absoluteMaxSize = 4096
+	const absoluteMaxSize = 7500
 
 	ht := newHeaderTracker()
 
@@ -421,31 +425,14 @@ func mergeUnits(units []splitUnit, chunkSize, chunkOverlap int) []Chunk {
 				curLen = 0
 			}
 
-			// Update header state even for oversized units. Keep a long table row
-			// source-backed and carry its active table header separately so parent-
-			// child splitting can preserve offsets while still embedding the context.
+			// Update header state even for oversized units
 			ht.update(u.text)
-			headers := ht.getHeaders()
-			headersLen := runeLen(headers)
-			const contextSeparatorLen = 2 // "\n\n" inserted by EmbeddingContent
-			if headersLen+contextSeparatorLen > absoluteMaxSize/2 ||
-				headerAlreadyPresent(headers, "", u.text) ||
-				headerColumnMismatch(headers, u.text) {
-				headers = ""
-				headersLen = 0
-			}
-			bodyLimit := absoluteMaxSize - headersLen
-			if headers != "" {
-				bodyLimit -= contextSeparatorLen
-			}
 
-			// Split this oversized unit into smaller chunks. Unlike the legacy
-			// emergency path, retain the configured overlap so lowering the ceiling
-			// does not reduce recall for content that previously stayed atomic.
+			// Split this oversized unit into smaller chunks
 			runes := []rune(u.text)
 			offset := 0
 			for offset < len(runes) {
-				chunkEnd := offset + bodyLimit
+				chunkEnd := offset + absoluteMaxSize
 				if chunkEnd > len(runes) {
 					chunkEnd = len(runes)
 				} else {
@@ -459,23 +446,12 @@ func mergeUnits(units []splitUnit, chunkSize, chunkOverlap int) []Chunk {
 
 				chunkText := string(runes[offset:chunkEnd])
 				chunks = append(chunks, Chunk{
-					Content:       chunkText,
-					ContextHeader: headers,
-					Seq:           len(chunks),
-					Start:         u.start + offset,
-					End:           u.start + chunkEnd,
+					Content: chunkText,
+					Seq:     len(chunks),
+					Start:   u.start + offset,
+					End:     u.start + chunkEnd,
 				})
-				nextOffset := chunkEnd
-				if chunkEnd < len(runes) && chunkOverlap > 0 {
-					// Emergency overlap is capped at half the body budget. Without
-					// this guard, a configured overlap >= bodyLimit advances by one
-					// rune per chunk and can amplify one unit into thousands of chunks.
-					overlap := min(chunkOverlap, bodyLimit/2, chunkEnd-offset-1)
-					if overlap > 0 {
-						nextOffset -= overlap
-					}
-				}
-				offset = nextOffset
+				offset = chunkEnd
 			}
 			continue
 		}
@@ -914,7 +890,6 @@ func SplitTextParentChild(text string, parentCfg, childCfg SplitterConfig) Paren
 			sub.Seq = childSeq
 			sub.Start += parent.Start
 			sub.End += parent.Start
-			sub.ContextHeader = mergeBreadcrumbs(parent.ContextHeader, sub.ContextHeader)
 			children = append(children, ChildChunk{
 				Chunk:       sub,
 				ParentIndex: parentIndex,

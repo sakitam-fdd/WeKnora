@@ -37,6 +37,144 @@ func knowledgeSSEEvent(t *testing.T, w io.Writer, resp StreamResponse, eventType
 	fmt.Fprintf(w, "data:%s\n\n", b)
 }
 
+func TestProcessAgentSSEStream_MultilineDataFrame(t *testing.T) {
+	frame := "data: {\"response_type\":\"answer\",\n" +
+		"data: \"content\":\"hello\",\"done\":false}\n\n"
+
+	c := &Client{}
+	var got *AgentStreamResponse
+	err := c.processAgentSSEStream(strings.NewReader(frame), func(resp *AgentStreamResponse) error {
+		got = resp
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("multiline SSE data frame failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("callback was not invoked")
+	}
+	if got.ResponseType != AgentResponseTypeAnswer || got.Content != "hello" {
+		t.Fatalf("response = %#v, want answer content hello", got)
+	}
+}
+
+func TestKnowledgeQAStream_MultilineDataFrame(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data:{\"response_type\":\"answer\",\n")
+		_, _ = fmt.Fprint(w, "data:\"content\":\"hello\",\"done\":false}\n\n")
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	var got *StreamResponse
+	err := c.KnowledgeQAStream(context.Background(), "sess", &KnowledgeQARequest{Query: "q"},
+		func(e *StreamResponse) error {
+			got = e
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("multiline knowledge SSE data frame failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("callback was not invoked")
+	}
+	if got.ResponseType != ResponseTypeAnswer || got.Content != "hello" {
+		t.Fatalf("response = %#v, want answer content hello", got)
+	}
+}
+
+func TestContinueStream_MultilineDataFrame(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event:message\n")
+		_, _ = fmt.Fprint(w, "data:{\"response_type\":\"answer\",\n")
+		_, _ = fmt.Fprint(w, "data:\"content\":\"hello\",\"done\":false}\n\n")
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	var got *StreamResponse
+	err := c.ContinueStream(context.Background(), "sess", "msg", func(e *StreamResponse) error {
+		got = e
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("multiline continue SSE data frame failed: %v", err)
+	}
+	if got == nil {
+		t.Fatal("callback was not invoked")
+	}
+	if got.ResponseType != ResponseTypeAnswer || got.Content != "hello" {
+		t.Fatalf("response = %#v, want answer content hello", got)
+	}
+}
+
+// emptyDataFrameStream wraps a bare `data:` frame between two real events;
+// the empty frame must be skipped, not parsed as JSON.
+const emptyDataFrameStream = "data:{\"response_type\":\"answer\",\"content\":\"a\"}\n\n" +
+	"data:\n\n" +
+	"data:{\"response_type\":\"answer\",\"content\":\"b\"}\n\n"
+
+func TestProcessAgentSSEStream_SkipsEmptyDataFrame(t *testing.T) {
+	c := &Client{}
+	var got []string
+	err := c.processAgentSSEStream(strings.NewReader(emptyDataFrameStream), func(resp *AgentStreamResponse) error {
+		got = append(got, resp.Content)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("empty SSE data frame aborted the stream: %v", err)
+	}
+	if strings.Join(got, ",") != "a,b" {
+		t.Fatalf("contents = %v, want [a b]", got)
+	}
+}
+
+func TestKnowledgeQAStream_SkipsEmptyDataFrame(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, emptyDataFrameStream)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	var got []string
+	err := c.KnowledgeQAStream(context.Background(), "sess", &KnowledgeQARequest{Query: "q"},
+		func(e *StreamResponse) error {
+			got = append(got, e.Content)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("empty SSE data frame aborted the stream: %v", err)
+	}
+	if strings.Join(got, ",") != "a,b" {
+		t.Fatalf("contents = %v, want [a b]", got)
+	}
+}
+
+func TestContinueStream_SkipsEmptyDataFrame(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event:message\n"+
+			strings.ReplaceAll(emptyDataFrameStream, "\n\n", "\n\nevent:message\n"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	var got []string
+	err := c.ContinueStream(context.Background(), "sess", "msg", func(e *StreamResponse) error {
+		got = append(got, e.Content)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("empty SSE data frame aborted the stream: %v", err)
+	}
+	if strings.Join(got, ",") != "a,b" {
+		t.Fatalf("contents = %v, want [a b]", got)
+	}
+}
+
 // TestProcessAgentSSEStream_DataLineLimits locks in the 4 MiB bufio.Scanner
 // cap raised from the 64 KiB default: a `references` event bundling chunk
 // contents reaches hundreds of KiB and previously errored "token too long".
@@ -279,123 +417,5 @@ func TestSearchResult_DecodesReferenceIndexes(t *testing.T) {
 	}
 	if len(r.SubChunkID) != 2 || r.SubChunkID[0] != "s1" || r.SubChunkID[1] != "s2" {
 		t.Errorf("SubChunkID=%v, want [s1 s2]", r.SubChunkID)
-	}
-}
-
-// splitJSONFrame renders v as a single SSE event whose JSON payload is split
-// across two `data:` lines at a structural comma, reproducing the multi-line
-// wire shape from Tencent/WeKnora#2121. A spec-compliant parser concatenates
-// the data lines with "\n" before parsing; the buggy parser kept only the
-// second fragment and failed to unmarshal.
-func splitJSONFrame(t *testing.T, w io.Writer, v interface{}, eventType string) {
-	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	s := string(b)
-	i := strings.IndexByte(s, ',')
-	if i < 0 {
-		t.Fatalf("payload has no structural comma to split: %s", s)
-	}
-	if eventType != "" {
-		fmt.Fprintf(w, "event:%s\n", eventType)
-	}
-	fmt.Fprintf(w, "data: %s\ndata: %s\n\n", s[:i+1], s[i+1:])
-}
-
-// TestProcessAgentSSEStream_MultipleDataLinesReassemble is the regression test
-// for Tencent/WeKnora#2121: an agent-stream event split across multiple `data:`
-// lines must be reassembled before JSON parsing.
-func TestProcessAgentSSEStream_MultipleDataLinesReassemble(t *testing.T) {
-	var buf strings.Builder
-	splitJSONFrame(t, &buf, AgentStreamResponse{
-		ResponseType: AgentResponseTypeAnswer,
-		Content:      "hello",
-		Done:         false,
-	}, "")
-
-	var got []*AgentStreamResponse
-	err := (&Client{}).processAgentSSEStream(strings.NewReader(buf.String()),
-		func(r *AgentStreamResponse) error {
-			got = append(got, r)
-			return nil
-		})
-	if err != nil {
-		t.Fatalf("multi-line agent event failed to parse: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("callbacks=%d, want 1", len(got))
-	}
-	if got[0].ResponseType != AgentResponseTypeAnswer || got[0].Content != "hello" || got[0].Done {
-		t.Errorf("got %+v, want {answer hello false}", got[0])
-	}
-}
-
-// TestKnowledgeQAStream_MultipleDataLinesReassemble covers the knowledge-QA
-// stream parser for Tencent/WeKnora#2121.
-func TestKnowledgeQAStream_MultipleDataLinesReassemble(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		splitJSONFrame(t, w, StreamResponse{ResponseType: ResponseTypeAnswer, Content: "hello"}, "")
-	}))
-	defer srv.Close()
-
-	c := NewClient(srv.URL)
-	var content string
-	err := c.KnowledgeQAStream(context.Background(), "sess", &KnowledgeQARequest{Query: "q"},
-		func(e *StreamResponse) error {
-			content = e.Content
-			return nil
-		})
-	if err != nil {
-		t.Fatalf("multi-line knowledge event failed to parse: %v", err)
-	}
-	if content != "hello" {
-		t.Errorf("content=%q, want %q", content, "hello")
-	}
-}
-
-// TestContinueStream_MultipleDataLinesReassemble covers the continue-stream
-// parser for Tencent/WeKnora#2121.
-func TestContinueStream_MultipleDataLinesReassemble(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		splitJSONFrame(t, w, StreamResponse{ResponseType: ResponseTypeAnswer, Content: "hello"}, "message")
-	}))
-	defer srv.Close()
-
-	c := NewClient(srv.URL)
-	var content string
-	err := c.ContinueStream(context.Background(), "sess", "msg", func(e *StreamResponse) error {
-		content = e.Content
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("multi-line continue event failed to parse: %v", err)
-	}
-	if content != "hello" {
-		t.Errorf("content=%q, want %q", content, "hello")
-	}
-}
-
-// TestAppendSSEData unit-tests the shared SSE data-line accumulation helper.
-func TestAppendSSEData(t *testing.T) {
-	tests := []struct {
-		name      string
-		buf, line string
-		want      string
-	}{
-		{"first line strips one leading space", "", "data: {\"a\":1}", `{"a":1}`},
-		{"first line without space", "", "data:{\"a\":1}", `{"a":1}`},
-		{"second line joined with newline", `{"a":1,`, "data: \"b\":2}", "{\"a\":1,\n\"b\":2}"},
-		{"empty data line yields empty buffer", "", "data:", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := appendSSEData(tt.buf, tt.line); got != tt.want {
-				t.Fatalf("appendSSEData(%q, %q) = %q, want %q", tt.buf, tt.line, got, tt.want)
-			}
-		})
 	}
 }
