@@ -1581,7 +1581,7 @@ onMounted(async () => {
   background: var(--td-error-color-1);
   border: 1px solid var(--td-error-color-3);
   border-radius: 6px;
-  font-size: 13px;
+  font-size: var(--app-text-md);
   line-height: 20px;
 }
 
