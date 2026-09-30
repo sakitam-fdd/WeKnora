@@ -35,6 +35,7 @@ jobs:
           set -e
 
           if [ "$merge_rc" -ne 0 ]; then
+            git diff --name-only --diff-filter=U > /tmp/upstream-conflicts.txt
             while IFS= read -r file; do
               [ -n "$file" ] || continue
               case "$file" in
@@ -50,7 +51,7 @@ jobs:
                   git add -- "$file"
                   ;;
               esac
-            done < <(git diff --name-only --diff-filter=U)
+            done < /tmp/upstream-conflicts.txt
           fi
 
           unresolved="$(git diff --name-only --diff-filter=U)"
