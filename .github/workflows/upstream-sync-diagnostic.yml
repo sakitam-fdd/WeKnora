@@ -1,4 +1,4 @@
-name: Resolve upstream sync
+name: Format upstream sync
 
 on:
   push:
@@ -9,58 +9,27 @@ permissions:
   contents: write
 
 jobs:
-  resolve:
+  format:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: main
+          ref: sync/merged-upstream-20260930
           fetch-depth: 0
-      - name: Merge current upstream and push resolved branch
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - name: Format restored prompt context code
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git remote add upstream https://github.com/Tencent/WeKnora.git
-          git fetch upstream main
-          git checkout -B sync/merged-upstream-20260930 origin/main
-
-          cp .github/workflows/go-lint.yml /tmp/go-lint.yml
-
-          set +e
-          git merge --no-commit --no-ff upstream/main
-          merge_rc=$?
-          set -e
-
-          if [ "$merge_rc" -ne 0 ]; then
-            git diff --name-only -z --diff-filter=U > /tmp/upstream-conflicts.bin
-            while IFS= read -r -d '' file; do
-              [ -n "$file" ] || continue
-              case "$file" in
-                ".github/workflows/go-lint.yml")
-                  cp /tmp/go-lint.yml "$file"
-                  git add -- "$file"
-                  ;;
-                "docs/RBAC说明.md"|"docs/api/chat.md"|"internal/models/embedding/openai.go"|"internal/models/embedding/openai_test.go")
-                  git rm -f -- "$file"
-                  ;;
-                *)
-                  git checkout --theirs -- "$file"
-                  git add -- "$file"
-                  ;;
-              esac
-            done < /tmp/upstream-conflicts.bin
+          gofmt -w internal/handler/session/qa.go internal/handler/session/types.go
+          if git diff --quiet; then
+            echo "No formatting changes needed"
+            exit 0
           fi
-
-          unresolved="$(git diff --name-only --diff-filter=U)"
-          if [ -n "$unresolved" ]; then
-            echo "Unresolved conflicts:"
-            echo "$unresolved"
-            exit 1
-          fi
-
-          git status --short
-          git commit -m "chore: merge upstream Tencent/WeKnora (2026-09-30)"
-          git push origin HEAD:refs/heads/sync/merged-upstream-20260930
+          git add internal/handler/session/qa.go internal/handler/session/types.go
+          git commit -m "style(go): format prompt context integration"
+          git push origin HEAD:sync/merged-upstream-20260930
