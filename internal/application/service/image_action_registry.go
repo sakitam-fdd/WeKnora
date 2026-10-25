@@ -548,15 +548,6 @@ func (r *runContext) think(ctx context.Context, prompt, key string) (string, err
 		&vlm.PredictOptions{Thinking: &on})
 }
 
-func (r *runContext) fieldByKey(key string) (types.ImageFieldDef, bool) {
-	for _, field := range r.declared {
-		if field.Key == key {
-			return field, true
-		}
-	}
-	return types.ImageFieldDef{}, false
-}
-
 // execute runs one action by id.
 //
 // An action this build does not implement is a programming error, not a state a

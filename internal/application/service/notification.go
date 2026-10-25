@@ -55,6 +55,7 @@ type PendingNotification struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// NotificationPage groups notification history, pending approvals, and pagination metadata.
 type NotificationPage struct {
 	Items      []*types.Notification  `json:"items"`
 	Pending    []*PendingNotification `json:"pending"`
