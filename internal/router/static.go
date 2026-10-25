@@ -25,6 +25,12 @@ func serveFrontendStatic(r *gin.Engine) {
 	if _, err := os.Stat(indexPath); err != nil {
 		return
 	}
+	embedIndexPath := filepath.Join(absDir, "embed.html")
+	embedIndexInfo, embedIndexErr := os.Stat(embedIndexPath)
+	hasEmbedIndex := embedIndexErr == nil && !embedIndexInfo.IsDir()
+	if !hasEmbedIndex {
+		logger.Warnf(context.Background(), "[Router] Embed entry %s is unavailable; /embed/* requests will return 404", embedIndexPath)
+	}
 
 	logger.Infof(context.Background(), "[Router] Serving frontend static files from %s", absDir)
 
@@ -45,7 +51,18 @@ func serveFrontendStatic(r *gin.Engine) {
 		// Embed pages need the dedicated entry point and the channel CSP set by
 		// embedFrameAncestorsMiddleware. Keep the main SPA same-origin only.
 		if strings.HasPrefix(path, "/embed/") {
-			c.File(filepath.Join(absDir, "embed.html"))
+			if !hasEmbedIndex {
+				c.Status(http.StatusNotFound)
+				c.Abort()
+				return
+			}
+			// The embed security middleware may already have set a stronger cache
+			// policy (currently no-store). Preserve it; only apply the static-file
+			// default when this middleware is used on its own.
+			if c.Writer.Header().Get("Cache-Control") == "" {
+				setFrontendCacheHeaders(c.Writer, "/embed.html")
+			}
+			c.File(embedIndexPath)
 			c.Abort()
 			return
 		}

@@ -22,7 +22,7 @@ func pipelineInfo(ctx context.Context, stage, action string, fields map[string]i
 	common.PipelineInfo(ctx, stage, action, fields)
 }
 
-// pipelineWarn logs pipeline warning level entries.
+// pipelineWarn logs pipeline warn level entries.
 func pipelineWarn(ctx context.Context, stage, action string, fields map[string]interface{}) {
 	common.PipelineWarn(ctx, stage, action, fields)
 }
@@ -43,7 +43,6 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 		return nil, nil, err
 	}
 
-	effort := chat.SanitizeReasoningEffort(ctx, chatManage.SummaryConfig.ReasoningEffort, "session summary config")
 	opt := &chat.ChatOptions{
 		Temperature:         chatManage.SummaryConfig.Temperature,
 		TopP:                chatManage.SummaryConfig.TopP,
@@ -53,13 +52,11 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 		FrequencyPenalty:    chatManage.SummaryConfig.FrequencyPenalty,
 		PresencePenalty:     chatManage.SummaryConfig.PresencePenalty,
 		Thinking:            chatManage.SummaryConfig.Thinking,
-		ReasoningEffort:     effort,
 		PromptCacheKey:      chatManage.SessionID,
 	}
-	if level, requested := opt.Reasoning(); requested {
+	if opt.Thinking != nil {
 		pipelineInfo(ctx, "Stream", "thinking_option", map[string]interface{}{
-			"enabled": level.Enabled(),
-			"level":   string(level),
+			"enabled": *opt.Thinking,
 		})
 	}
 
@@ -77,8 +74,13 @@ func prepareMessagesWithHistory(chatManage *types.ChatManage) []chat.Message {
 	systemPrompt := types.RenderPromptPlaceholders(base, types.PlaceholderValues{
 		"query":    chatManage.Query,
 		"language": chatManage.Language,
-		"contexts": chatManage.RenderedContexts,
+		// Retrieved content is emitted separately as untrusted source data by the
+		// model-context layer. Keep it out of configurable system templates so
+		// document instructions cannot inherit system-level priority.
+		"contexts": "",
 	})
+	// Keep source-boundary and output rules in the stable system prefix. They
+	// apply to every turn and must not change merely because retrieval happened.
 	systemPrompt += "\n\n" + types.SourceDataBoundaryPrompt + "\n\n" + types.SourcedAnswerOutputPrompt
 	// Memory goes at the end of the system prompt, after the retrieved-context
 	// placeholders have been rendered, so a remembered sentence can never be
