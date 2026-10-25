@@ -12,11 +12,13 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/application/access"
 	"github.com/Tencent/WeKnora/internal/application/repository"
+	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/common"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
+	"github.com/Tencent/WeKnora/internal/infrastructure/docparser/anydoc"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/asr"
 	"github.com/Tencent/WeKnora/internal/models/chat"
@@ -97,7 +99,9 @@ func (s *knowledgeService) cloneKnowledge(
 		}
 		srcSvc := s.resolveFileServiceForPath(ctx, srcKB, src.FilePath)
 		dstSvc := s.resolveFileService(ctx, targetKB)
-		newPath, copyErr := copyOwnedObject(ctx, srcSvc, dstSvc, src.FilePath, targetKB.TenantID, dst.ID)
+		newPath, copyErr := copyOwnedObject(
+			ctx, srcSvc, dstSvc, src.FilePath, targetKB.TenantID, dst.ID,
+			s.resourceCatalog, types.ResourceRelationSourceFile)
 		if copyErr != nil {
 			return fmt.Errorf("clone knowledge file copy failed: %w", copyErr)
 		}
@@ -111,7 +115,10 @@ func (s *knowledgeService) cloneKnowledge(
 		}
 		stored, loadErr := s.repo.GetKnowledgeByID(ctx, dst.TenantID, dst.ID)
 		if errors.Is(loadErr, repository.ErrKnowledgeNotFound) {
-			cleanupCopiedObjects(ctx, s.resolveFileService(ctx, targetKB), copiedFilePaths)
+			cleanupCopiedObjects(
+				ctx, s.resolveFileService(ctx, targetKB),
+				knowledgeResourceOwners(s.resourceCatalog, dst.ID), copiedFilePaths,
+			)
 			return
 		}
 		// An uncertain save/read must not delete objects that may be referenced.
@@ -206,6 +213,39 @@ type ProcessChunksOptions struct {
 	// child's ParentIndex references an entry in this slice.
 	ParentChunks []types.ParsedParentChunk
 	Metadata     map[string]string
+}
+
+func imagesForMultimodal(images []docparser.StoredImage) []docparser.StoredImage {
+	selected := make([]docparser.StoredImage, 0, len(images))
+	for _, image := range images {
+		if !image.SkipMultimodal {
+			selected = append(selected, image)
+		}
+	}
+	return selected
+}
+
+func cleanupUnboundInlineImages(
+	ctx context.Context, fileSvc interfaces.FileService, images []docparser.StoredImage,
+) {
+	if fileSvc == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	deleted := make(map[string]struct{})
+	for _, image := range images {
+		if (!image.Inline && !image.NewlyStored) || image.ServingURL == "" {
+			continue
+		}
+		if _, exists := deleted[image.ServingURL]; exists {
+			continue
+		}
+		deleted[image.ServingURL] = struct{}{}
+		if err := fileSvc.DeleteFile(cleanupCtx, image.ServingURL); err != nil {
+			logger.Warnf(ctx, "Failed to clean up unbound inline image %s: %v", image.ServingURL, err)
+		}
+	}
 }
 
 // finalizeIndexedKnowledgeState makes a document retrievable as soon as chunks
@@ -336,6 +376,23 @@ func buildSplitterConfigFromChunking(cc types.ChunkingConfig) chunker.SplitterCo
 // ContextHeader breadcrumbs regardless of the configured strategy.
 func buildParentChildConfigs(cc types.ChunkingConfig, base chunker.SplitterConfig) (parent, child chunker.SplitterConfig) {
 	return chunker.DeriveParentChildConfigs(base, cc.ParentChunkSize, cc.ChildChunkSize)
+}
+
+// deleteUnindexedChunks drops the chunks processChunks wrote for a knowledge
+// that failed before BatchIndex ran. Nothing reached the vector store yet, so
+// only the chunk rows need removing; left alone they would stay active under a
+// failed knowledge, the same leftovers the BatchIndex failure path cleans up.
+func (s *knowledgeService) deleteUnindexedChunks(ctx context.Context, knowledge *types.Knowledge) {
+	if err := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID); err != nil {
+		logger.Errorf(ctx, "Delete chunks failed: %v", err)
+	}
+}
+
+// supersededChunkPurger is intentionally narrower than ChunkRepository: only
+// persistent repositories that can prove a newer active replacement should
+// physically reclaim soft-deleted chunk history.
+type supersededChunkPurger interface {
+	PurgeSupersededChunksByKnowledgeID(context.Context, uint64, string) (int64, error)
 }
 
 // processChunks processes chunks and creates embeddings for knowledge content
@@ -692,6 +749,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				knowledge.ErrorMessage = err.Error()
 				knowledge.UpdatedAt = time.Now()
 				s.repo.UpdateKnowledge(ctx, knowledge)
+				s.deleteUnindexedChunks(ctx, knowledge)
 				return nil
 			}
 			// Check if there's enough storage quota available
@@ -700,6 +758,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				knowledge.ErrorMessage = "存储空间不足"
 				knowledge.UpdatedAt = time.Now()
 				s.repo.UpdateKnowledge(ctx, knowledge)
+				s.deleteUnindexedChunks(ctx, knowledge)
 				return nil
 			}
 		}
@@ -723,10 +782,19 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 
 		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
 		if err != nil {
-			knowledge.ParseStatus = types.ParseStatusFailed
-			knowledge.ErrorMessage = err.Error()
-			knowledge.UpdatedAt = time.Now()
-			s.repo.UpdateKnowledge(ctx, knowledge)
+			// Embedding and vector-store errors are often transient. While the
+			// task has attempts left, leave the row processing and hand the
+			// error to the queue so the idempotent parse runs again; only the
+			// final attempt (or a caller without a retry loop) records failure.
+			willRetry := summaryTaskWillRetry(ctx)
+			if !willRetry {
+				knowledge.ParseStatus = types.ParseStatusFailed
+				knowledge.ErrorMessage = err.Error()
+				knowledge.UpdatedAt = time.Now()
+				if updateErr := s.repo.UpdateKnowledge(ctx, knowledge); updateErr != nil {
+					logger.Errorf(ctx, "Update knowledge status failed after batch index error: %v", updateErr)
+				}
+			}
 
 			// delete failed chunks
 			if err := s.chunkRepo.DeleteChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID); err != nil {
@@ -744,6 +812,11 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			code := werrors.ErrCodeVectorStoreWriteFailed
 			if isLikelyRateLimitError(err) {
 				code = werrors.ErrCodeEmbeddingRateLimit
+			}
+			if willRetry {
+				s.failStageRetryable(ctx, knowledge.ID, types.StageEmbedding,
+					code, "batch index failed", err)
+				return fmt.Errorf("batch index: %w", err)
 			}
 			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
 				code, "batch index failed", err)
@@ -789,6 +862,20 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	if s.currentAttemptSuperseded(ctx, knowledge.ID) {
 		logger.Infof(ctx, "Parse attempt superseded, skipping completion: %s", knowledge.ID)
 		return nil
+	}
+
+	// Reparse has now written the replacement chunks and, when enabled, their
+	// replacement indexes. Only at this successful point is it safe to reclaim
+	// old soft-deleted rows. Keep this optional at the interface boundary so
+	// existing non-SQL repositories and narrow test doubles retain their
+	// lifecycle behavior; the concrete SQL chunk repository implements it.
+	if purger, ok := s.chunkRepo.(supersededChunkPurger); ok {
+		purged, purgeErr := purger.PurgeSupersededChunksByKnowledgeID(ctx, knowledge.TenantID, knowledge.ID)
+		if purgeErr != nil {
+			logger.Warnf(ctx, "Failed to purge superseded chunks for knowledge %s: %v", knowledge.ID, purgeErr)
+		} else if purged > 0 {
+			logger.Infof(ctx, "Purged %d superseded chunks for knowledge %s", purged, knowledge.ID)
+		}
 	}
 
 	now := time.Now()
@@ -864,15 +951,81 @@ type documentProfileOutput struct {
 	TypicalQuestion string   `json:"typical_question"`
 }
 
+// normalizeSummaryReplyContent strips a UTF-8 BOM, the surrounding whitespace
+// and one markdown code fence from a summary reply, so shape detection and
+// parsing look at the same text. A fence without a newline carries no payload
+// we can classify, so it normalizes to the empty string.
+func normalizeSummaryReplyContent(content string) string {
+	content = strings.TrimSpace(strings.TrimPrefix(content, "\uFEFF"))
+	if rest, ok := strings.CutPrefix(content, "```"); ok {
+		// Drop the fence's info string (```json) and the newline after it.
+		idx := strings.IndexByte(rest, '\n')
+		if idx < 0 {
+			return ""
+		}
+		content = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(rest[idx+1:]), "```"))
+	}
+	return content
+}
+
+// summaryReplyIsJSONShaped reports whether the reply really is a structured
+// JSON payload, either directly or inside a markdown code fence. Only such
+// replies are held to the structured contract below; anything else is a
+// legacy plain-text summary.
+//
+// An object opening ("{") always counts, parseable or not: half an object is
+// exactly the reply that must never be stored as a summary. A bracket opening
+// is ambiguous — "[1] …" and "[文档摘要] …" are prose with a leading citation,
+// not broken JSON — so it only counts when the reply is a JSON array or opens
+// an array of objects/strings.
+func summaryReplyIsJSONShaped(content string) bool {
+	content = normalizeSummaryReplyContent(content)
+	if content == "" {
+		return false
+	}
+	switch content[0] {
+	case '{':
+		return true
+	case '[':
+		var arr []json.RawMessage
+		if json.Unmarshal([]byte(content), &arr) == nil {
+			return true
+		}
+		first := strings.TrimLeft(content[1:], " \t\r\n")
+		return strings.HasPrefix(first, "{") ||
+			strings.HasPrefix(first, "[") ||
+			strings.HasPrefix(first, `"`)
+	default:
+		return false
+	}
+}
+
 // parseDocumentSummaryOutput accepts both the structured JSON reply and a
 // legacy plain-text summary (custom templates, older models). Plain text is
 // stored as the summary with no profile, so nothing that worked before
 // regresses; only the knowledge-base aggregation loses that document's topics.
-func parseDocumentSummaryOutput(content string) *documentSummaryResult {
-	content = strings.TrimSpace(content)
+//
+// A reply that opens like JSON is held to the JSON contract instead: a broken
+// object (output cut off at MaxTokens, an unescaped newline inside a string)
+// or an object with no usable text returns errSummaryOutputNotParsable. The
+// raw reply used to be stored as the summary, which put half a JSON object in
+// knowledges.description, marked the summary completed so Asynq never retried
+// it, and embedded the same fragment into the RAG index.
+func parseDocumentSummaryOutput(content string) (*documentSummaryResult, error) {
+	// Some providers prefix the reply with a UTF-8 BOM; TrimSpace alone would
+	// leave it in place, hide the "{" and let half an object through as prose.
+	content = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(content), "\uFEFF"))
+	if content == "" {
+		return nil, errEmptySummaryOutput
+	}
+	jsonShaped := summaryReplyIsJSONShaped(content)
 	var out documentProfileOutput
 	if err := common.ParseLLMJsonResponse(content, &out); err != nil {
-		return &documentSummaryResult{Summary: content}
+		if jsonShaped {
+			return nil, fmt.Errorf("%w: %w", errSummaryOutputNotParsable, err)
+		}
+		// Legacy plain text: keep it as the summary with no profile.
+		return &documentSummaryResult{Summary: content}, nil
 	}
 	summary := strings.TrimSpace(out.Summary)
 	profile := (&types.KnowledgeProfile{
@@ -885,11 +1038,15 @@ func parseDocumentSummaryOutput(content string) *documentSummaryResult {
 		summary = profile.Gist
 	}
 	if summary == "" {
-		// JSON without usable text: fall back to the raw content so the
-		// caller's empty-output handling still applies.
-		return &documentSummaryResult{Summary: content}
+		if jsonShaped {
+			// JSON without usable text is as unusable as broken JSON: the
+			// caller must fail the attempt instead of storing the object.
+			return nil, errSummaryOutputNotParsable
+		}
+		// Plain text that happened to contain balanced JSON punctuation.
+		return &documentSummaryResult{Summary: content}, nil
 	}
-	return &documentSummaryResult{Summary: summary, Profile: profile}
+	return &documentSummaryResult{Summary: summary, Profile: profile}, nil
 }
 
 // buildSummaryChunkContent is the text embedded for the document-level
@@ -921,13 +1078,23 @@ const imageDominatedTextThreshold = 200
 var (
 	errInsufficientSummaryContent = errors.New("insufficient text content for summary generation")
 	errEmptySummaryOutput         = errors.New("summary model returned empty output")
+	// errSummaryOutputNotParsable marks a reply that is JSON-shaped but yields
+	// no usable summary text — broken JSON (cut off at the completion budget,
+	// unescaped newline) or an object without summary/gist. It is deliberately
+	// not stored: the raw reply is not a summary.
+	errSummaryOutputNotParsable = errors.New("summary model returned JSON without a usable summary")
+	// errSummaryOutputTruncated marks a reply the provider stopped at the
+	// completion budget, so its JSON can never be trusted as complete.
+	errSummaryOutputTruncated = errors.New("summary model output was truncated at the completion budget")
 )
 
 const summaryFallbackMaxRunes = 500
 
 // validateSummaryOutput rejects successful model responses that contain no
-// user-visible text. Treating whitespace-only output as an error lets Asynq
-// retry the summary task instead of persisting description="" as completed.
+// user-visible text. It only looks at the content shape: a provider that
+// stopped at the completion budget can still return usable text, and the older
+// plain-text consumers (custom summary templates, table/column descriptions)
+// deliberately keep whatever the model produced.
 func validateSummaryOutput(response *types.ChatResponse) (string, error) {
 	if response == nil {
 		return "", errEmptySummaryOutput
@@ -935,6 +1102,27 @@ func validateSummaryOutput(response *types.ChatResponse) (string, error) {
 	content := strings.TrimSpace(response.Content)
 	if content == "" {
 		return "", errEmptySummaryOutput
+	}
+	return content, nil
+}
+
+// validateStructuredSummaryDocument is the validator for the document-summary
+// entry point (getSummary). On top of validateSummaryOutput it rejects a reply
+// the provider cut off at the completion budget — but only when the reply was
+// producing a structured summary, because that is the case where the truncated
+// text is half a JSON object. A plain-text summary that hit the budget is
+// still usable text and keeps the legacy fallback.
+//
+// The shape is judged before the finish reason, so "finish_reason=length" can
+// never turn a plain-text reply into a failure on its own.
+func validateStructuredSummaryDocument(response *types.ChatResponse) (string, error) {
+	content, err := validateSummaryOutput(response)
+	if err != nil {
+		return "", err
+	}
+	structured := summaryReplyIsJSONShaped(content)
+	if structured && chatpipeline.IsLengthFinishReason(response.FinishReason) {
+		return "", errSummaryOutputTruncated
 	}
 	return content, nil
 }
@@ -992,6 +1180,7 @@ func (s *knowledgeService) saveSummaryState(ctx context.Context, knowledge *type
 
 // summaryTaskWillRetry reports whether the current Asynq delivery has another
 // configured attempt remaining. Calls outside an Asynq worker are terminal.
+// Despite the name it is not summary-specific; processChunks uses it too.
 func summaryTaskWillRetry(ctx context.Context) bool {
 	retried, retryOK := asynq.GetRetryCount(ctx)
 	maxRetry, maxRetryOK := asynq.GetMaxRetry(ctx)
@@ -1173,12 +1362,16 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		logger.GetLogger(ctx).WithField("error", err).Errorf("GetSummary failed")
 		return nil, err
 	}
-	content, err := validateSummaryOutput(summary)
+	content, err := validateStructuredSummaryDocument(summary)
 	if err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Warnf("GetSummary returned no usable content")
 		return nil, err
 	}
-	result := parseDocumentSummaryOutput(content)
+	result, err := parseDocumentSummaryOutput(content)
+	if err != nil {
+		logger.GetLogger(ctx).WithField("error", err).Warnf("GetSummary returned unusable content")
+		return nil, err
+	}
 	logger.GetLogger(ctx).WithField("summary", result.Summary).
 		WithField("has_profile", result.Profile != nil).Infof("GetSummary success")
 	return result, nil
@@ -3127,6 +3320,11 @@ func (s *knowledgeService) updateChunkVector(ctx context.Context, kbID string, c
 			logger.Warnf(ctx, "Knowledge base ID mismatch: %s != %s", chunk.KnowledgeBaseID, kbID)
 			continue
 		}
+		// Its index row holds the image's own vector, which re-embedding
+		// Content here would replace with a text vector of the caption.
+		if chunk.ChunkType == types.ChunkTypeImageVector {
+			continue
+		}
 		ids = append(ids, chunk.ID)
 		if !chunk.IsEnabled || chunk.ChunkType == types.ChunkTypeParentText {
 			continue
@@ -3277,6 +3475,15 @@ func (s *knowledgeService) UpdateImageInfo(
 			// Update OCR if it has changed
 			if image.OCRText != cImageInfo[0].OCRText {
 				child.Content = image.OCRText
+				child.ImageInfo = imageInfo
+				updateChunk = append(updateChunk, chunkChildren[i])
+			}
+		case types.ChunkTypeImageVector:
+			// The image's vector does not change with its caption, only the
+			// text shown and reranked for it; updateChunkVector leaves the
+			// vector alone.
+			if image.Caption != "" && image.Caption != child.Content {
+				child.Content = image.Caption
 				child.ImageInfo = imageInfo
 				updateChunk = append(updateChunk, chunkChildren[i])
 			}
@@ -3886,22 +4093,50 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 
 	// Step 2: Store images and update markdown references
 	var storedImages []docparser.StoredImage
+	var imageFileSvc interfaces.FileService
+	var inlineParseErr error
 
 	if s.imageResolver != nil && convertResult != nil {
-		fileSvc := s.resolveFileService(ctx, kb)
+		imageFileSvc = s.resolveFileService(ctx, kb)
 		tenantID, _ := ctx.Value(types.TenantIDContextKey).(uint64)
-		updatedMarkdown, images, resolveErr := s.imageResolver.ResolveAndStore(ctx, convertResult, fileSvc, tenantID)
-		if resolveErr != nil {
-			logger.Warnf(ctx, "Image resolution partially failed: %v", resolveErr)
+		updatedMarkdown, images, resolveErr := s.imageResolver.ResolveAndStore(
+			ctx, convertResult, imageFileSvc, tenantID)
+		if errors.Is(resolveErr, docparser.ErrAmbiguousInlineImage) {
+			inlineParseErr = resolveErr
+			images = nil // ResolveAndStore already rolled back this attempt's uploads.
+		} else if resolveErr != nil {
+			_, err := s.failKnowledge(ctx, knowledge, isLastRetry, "store inline image: %v", resolveErr)
+			return err
 		}
-		if updatedMarkdown != "" {
-			convertResult.MarkdownContent = updatedMarkdown
-		}
+		convertResult.MarkdownContent = updatedMarkdown
 		storedImages = images
 
+	}
+	if inlineParseErr != nil ||
+		(convertResult != nil && docparser.HasUnresolvedInlineImagePayload(convertResult.MarkdownContent)) {
+		message := "unresolved inline image base64 payload remains before chunking"
+		if inlineParseErr != nil {
+			message = inlineParseErr.Error()
+		}
+		logger.Errorf(ctx, "Knowledge %s: %s", knowledge.ID, message)
+		cleanupUnboundInlineImages(ctx, imageFileSvc, storedImages)
+		knowledge.ParseStatus = types.ParseStatusFailed
+		knowledge.ErrorMessage = message
+		knowledge.UpdatedAt = time.Now()
+		s.beginStage(ctx, knowledge.ID, types.StageChunking, nil)
+		s.failStage(ctx, knowledge.ID, types.StageChunking, werrors.ErrCodeChunkingFailed, message, nil)
+		if err := s.updateKnowledgeUnlessSourceReplaced(ctx, knowledge); err != nil {
+			return fmt.Errorf("%w: persist inline image processing failure: %v", asynq.SkipRetry, err)
+		}
+		return fmt.Errorf("%s: %w", message, asynq.SkipRetry)
+	}
+
+	if s.imageResolver != nil && convertResult != nil {
+		tenantID, _ := ctx.Value(types.TenantIDContextKey).(uint64)
 		// Resolve remote http(s) images (e.g. markdown external URLs) → download + upload to storage.
 		// ResolveAndStore handles inline bytes and base64; ResolveRemoteImages handles http/https URLs.
-		updatedContent, remoteImages, remoteErr := s.imageResolver.ResolveRemoteImages(ctx, convertResult.MarkdownContent, fileSvc, tenantID)
+		updatedContent, remoteImages, remoteErr := s.imageResolver.ResolveRemoteImages(
+			ctx, convertResult.MarkdownContent, imageFileSvc, tenantID)
 		if remoteErr != nil {
 			logger.Warnf(ctx, "Remote image resolution partially failed: %v", remoteErr)
 		}
@@ -3928,11 +4163,12 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	// HTML tables were normalized before image resolution above.
 	chunkCfg := buildSplitterConfigFromChunking(eff.ChunkingConfig)
 
+	multimodalImages := imagesForMultimodal(storedImages)
 	processOpts := ProcessChunksOptions{
 		EnableQuestionGeneration: payload.EnableQuestionGeneration,
 		QuestionCount:            payload.QuestionCount,
 		EnableMultimodel:         payload.EnableMultimodel,
-		StoredImages:             storedImages,
+		StoredImages:             multimodalImages,
 	}
 
 	if convertResult != nil {
@@ -4094,16 +4330,18 @@ func (s *knowledgeService) convert(
 	if !isURL {
 		fileReader, err := s.resolveFileServiceForPath(ctx, kb, payload.FilePath).GetFile(ctx, payload.FilePath)
 		if err != nil {
-			s.failStage(ctx, knowledge.ID, types.StageDocReader,
-				werrors.ErrCodeDocReaderParseFailed, "failed to get file", err)
-			return s.failKnowledge(ctx, knowledge, isLastRetry, "failed to get file: %v", err)
+			result, taskErr := s.failKnowledge(ctx, knowledge, isLastRetry, "failed to get file: %v", err)
+			s.failStageWithRetry(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "failed to get file", err, taskErr != nil)
+			return result, taskErr
 		}
 		defer fileReader.Close()
 		contentBytes, err := io.ReadAll(fileReader)
 		if err != nil {
-			s.failStage(ctx, knowledge.ID, types.StageDocReader,
-				werrors.ErrCodeDocReaderParseFailed, "failed to read file", err)
-			return s.failKnowledge(ctx, knowledge, isLastRetry, "failed to read file: %v", err)
+			result, taskErr := s.failKnowledge(ctx, knowledge, isLastRetry, "failed to read file: %v", err)
+			s.failStageWithRetry(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "failed to read file", err, taskErr != nil)
+			return result, taskErr
 		}
 		req.FileContent = contentBytes
 		req.FileName = payload.FileName
@@ -4111,12 +4349,17 @@ func (s *knowledgeService) convert(
 	}
 
 	result, err := s.callDocReaderWithTimeout(ctx, reader, req)
+	// Parser resource limits are permanent document rejections, not transient reader failures.
+	if errors.Is(err, anydoc.ErrResourceLimit) {
+		result, err = &types.ReadResult{Error: err.Error()}, nil
+	}
 	if err != nil {
 		code, message := docReaderFailure(err)
 		logger.Errorf(ctx, "[convert] DocReader failed knowledge=%s code=%s: %v", knowledge.ID, code, err)
-		s.failStage(ctx, knowledge.ID, types.StageDocReader,
-			code, message, err)
-		return s.failKnowledge(ctx, knowledge, isLastRetry, "%s", message)
+		result, taskErr := s.failKnowledge(ctx, knowledge, isLastRetry, "%s", message)
+		s.failStageWithRetry(ctx, knowledge.ID, types.StageDocReader,
+			code, message, err, taskErr != nil)
+		return result, taskErr
 	}
 	sanitizeReadResult(result)
 	if result.Error != "" {
@@ -4296,20 +4539,21 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 		}
 
 		payload := types.ImageMultimodalPayload{
-			TenantID:          knowledge.TenantID,
-			KnowledgeID:       knowledge.ID,
-			KnowledgeBaseID:   kb.ID,
-			ChunkID:           chunkID,
-			ImageURL:          img.ServingURL,
-			EnableOCR:         true,
-			EnableCaption:     true,
-			ImageAttrsEnabled: eff.ImageAttrsEnabled,
-			ImageActions:      eff.ImageActions,
-			Language:          lang,
-			ImageSourceType:   metadata["image_source_type"],
-			Attempt:           attempt,
-			ImageIndex:        idx,
-			SourceLocators:    img.SourceLocators,
+			TenantID:            knowledge.TenantID,
+			KnowledgeID:         knowledge.ID,
+			KnowledgeBaseID:     kb.ID,
+			ChunkID:             chunkID,
+			ImageURL:            img.ServingURL,
+			ImagePipelineID:     eff.ImagePipelineID,
+			ImagePipelineParams: eff.ImagePipelineParams,
+			ImageAttrsEnabled:   eff.ImageAttrsEnabled,
+			ImageActions:        eff.ImageActions,
+			Language:            lang,
+			ImageSourceType:     metadata["image_source_type"],
+			Attempt:             attempt,
+			ImageIndex:          idx,
+			SourceLocators:      img.SourceLocators,
+			ImageVectorEnabled:  &eff.ImageVectorEnabled,
 		}
 
 		langfuse.InjectTracing(ctx, &payload)

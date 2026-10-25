@@ -182,7 +182,7 @@ func getSearchResultFromHistory(chatManage *types.ChatManage) []*types.SearchRes
 
 func removeDuplicateResults(results []*types.SearchResult) []*types.SearchResult {
 	seen := make(map[string]bool)
-	contentSig := make(map[string]string) // sig -> first chunk ID
+	contentSig := make(map[string]*types.SearchResult) // sig -> first chunk
 	var uniqueResults []*types.SearchResult
 	for _, r := range results {
 		// Only deduplicate by exact chunk ID — do NOT treat shared ParentChunkID
@@ -195,10 +195,13 @@ func removeDuplicateResults(results []*types.SearchResult) []*types.SearchResult
 		sig := buildContentSignature(r.Content)
 		if sig != "" {
 			if firstChunk, exists := contentSig[sig]; exists {
-				logger.Debugf(context.Background(), "Dedup: chunk %s removed due to content signature (dup of %s, sig prefix: %.50s...)", r.ID, firstChunk, sig)
+				logger.Debugf(context.Background(),
+					"Dedup: chunk %s removed due to content signature (dup of %s, sig prefix: %.50s...)",
+					r.ID, firstChunk.ID, sig)
+				searchutil.InheritImageEvidence(firstChunk, r)
 				continue
 			}
-			contentSig[sig] = r.ID
+			contentSig[sig] = r
 		}
 		seen[r.ID] = true
 		uniqueResults = append(uniqueResults, r)
@@ -301,6 +304,7 @@ func removePartialOverlaps(ctx context.Context, results []*types.SearchResult) [
 			if victim == i {
 				keptIdx = j
 			}
+			searchutil.InheritImageEvidence(entries[keptIdx].result, entries[victim].result)
 			pipelineInfo(ctx, "Merge", "partial_overlap_drop", map[string]interface{}{
 				"kept_id":    entries[keptIdx].result.ID,
 				"dropped_id": entries[victim].result.ID,
@@ -357,10 +361,10 @@ func targetReportsEmbedFailure(kb *types.KnowledgeBase) bool {
 }
 
 // searchByTargets performs KB searches using pre-computed SearchTargets.
-// Targets sharing the same underlying embedding model (identified by model
-// name + endpoint, not just model ID) are grouped so the query embedding is
-// computed once per model AND all full-KB targets in a group are combined into
-// a single retrieval call, reducing both embedding API calls and DB round-trips.
+// Targets sharing the same model name, endpoint and configured vector dimension
+// are grouped even across model IDs. Each group computes one query embedding
+// and combines all full-KB targets into a single retrieval call, reducing both
+// embedding API calls and DB round-trips.
 func (p *PluginSearch) searchByTargets(
 	ctx context.Context,
 	chatManage *types.ChatManage,
@@ -393,8 +397,9 @@ func (p *PluginSearch) searchByTargets(
 		})
 	}
 
-	// Resolve actual model identities (name + endpoint) so that cross-tenant
-	// KBs backed by the same physical model share one embedding computation.
+	// Resolve actual model identities (name + endpoint + configured dimension)
+	// so that cross-tenant KBs backed by the same vector space share one
+	// embedding computation.
 	modelKeyMap := p.knowledgeBaseService.ResolveEmbeddingModelKeys(ctx, kbList)
 
 	groups := make(map[string][]*types.SearchTarget)

@@ -88,6 +88,8 @@ type WikiPageService interface {
 	GetStats(ctx context.Context, kbID string) (*types.WikiStats, error)
 
 	// RebuildLinks re-parses all pages and rebuilds bidirectional link references.
+	// It is best-effort: pages that could not be written are skipped, and any
+	// such failure is returned as a joined error counting the failed pages.
 	RebuildLinks(ctx context.Context, kbID string) error
 
 	// InjectCrossLinks scans specified pages and injects [[wiki-links]] for mentions
@@ -148,9 +150,9 @@ type WikiPageService interface {
 	// Used by rebuildIndexPage's first-time generation path.
 	ListByTypeRecent(ctx context.Context, kbID string, pageType string, limit int) ([]types.WikiIndexEntry, error)
 
-	// FindSimilarPages performs a pg_trgm similarity search over
-	// page titles. Used by the dedup pre-filter to surface candidate
-	// merge targets server-side.
+	// FindSimilarPages performs a title similarity search over page titles.
+	// PostgreSQL uses pg_trgm; Lite uses a SQLite-compatible fallback. Used by
+	// the dedup pre-filter to surface candidate merge targets server-side.
 	FindSimilarPages(ctx context.Context, kbID string, query string, pageTypes []string, limit int) ([]*types.WikiPageLite, error)
 
 	// FindPagesByNormalizedTitle returns non-archived pages of pageType whose
